@@ -210,6 +210,18 @@ export async function publishSkillToRegistry(
     );
   }
 
+  // Guard against publishing an unrelated folder by mistake: require a skill or
+  // plugin marker unless the caller explicitly forces the kind.
+  const hasSkillMarker = await pathExists(path.join(sourcePath, 'SKILL.md'));
+  const hasPluginMarker = await pathExists(
+    path.join(sourcePath, '.claude-plugin', 'plugin.json'),
+  );
+  if (!hasSkillMarker && !hasPluginMarker && !options.kind) {
+    throw new AgentPmError(
+      `${sourcePath} has no SKILL.md or .claude-plugin/plugin.json. Point at a skill or plugin folder, or pass an explicit --kind to publish it anyway.`,
+    );
+  }
+
   const inferred = await inferSkillMetadata(sourcePath);
 
   let version = options.version;

@@ -98,6 +98,73 @@ describe('registry server', () => {
   );
 
   test(
+    'rejects a path-traversal version on publish',
+    async () => {
+      const server = await startServer();
+      const token = server.bootstrap!.token;
+      const skillDir = await makeSkillFixture('trav-skill', 'x');
+      await expect(
+        publishSkillToRegistry({
+          registryUrl: server.url,
+          sourcePath: skillDir,
+          version: '../../../../etc/pwn',
+          env: { AGENTPM_REGISTRY_TOKEN: token },
+        }),
+      ).rejects.toThrow(/valid "version"/);
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'index archive URLs resolve identically from /index.json and /v1/index.json',
+    async () => {
+      const server = await startServer();
+      const token = server.bootstrap!.token;
+      const env = { AGENTPM_REGISTRY_TOKEN: token };
+      const skillDir = await makeSkillFixture('alias-skill', 'aliased');
+      await publishSkillToRegistry({
+        registryUrl: server.url,
+        sourcePath: skillDir,
+        env,
+      });
+
+      for (const indexPath of ['/index.json', '/v1/index.json']) {
+        const index = await loadRegistryIndex(`${server.url}${indexPath}`, env);
+        const entry = index.entries.find((item) => item.name === 'alias-skill');
+        expect(entry).toBeDefined();
+        const archiveUrl = new URL(
+          entry!.archive!,
+          `${server.url}${indexPath}`,
+        ).href;
+        expect(archiveUrl).not.toContain('/v1/v1/');
+        const { archive } = await fetchSkillArchive(archiveUrl, env);
+        expect(archive.name).toBe('alias-skill');
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'a private server returns 401 to anonymous index reads',
+    async () => {
+      const dataDir = await makeTempDir('agentpm-registry-private-');
+      const handle = await startRegistryServer({
+        dataDir,
+        port: 0,
+        publicRead: false,
+      });
+      handles.push(handle);
+      const anonHome = await makeTempDir('agentpm-anon-');
+      await expect(
+        loadRegistryIndex(`${handle.url}/index.json`, {
+          AGENTPM_HOME: anonHome,
+        }),
+      ).rejects.toThrow(/401|authentication/i);
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
     'visibility, login, and user management',
     async () => {
       const server = await startServer();
@@ -244,6 +311,12 @@ describe('registry server', () => {
           'roundtrip v2',
         );
 
+        // doctor must not flag a healthy archive install as missing content.
+        const issues = await service.doctor();
+        expect(
+          issues.some((issue) => issue.code === 'source-content-missing'),
+        ).toBe(false);
+
         const removed = await service.removeInstall('rt-skill');
         expect(removed.name).toBe('rt-skill');
         await expect(fs.access(install.targetPath)).rejects.toThrow();
@@ -312,6 +385,46 @@ describe('claude code plugins', () => {
 
         await service.removeInstall('demo-plugin');
         await expect(fs.access(marketplacePath)).rejects.toThrow();
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'an unsafe plugin manifest name cannot escape the plugins directory',
+    async () => {
+      const homeDir = await makeTempDir('agentpm-home-');
+      const projectDir = await makeTempDir('agentpm-plugin-project-');
+      const repoDir = await makeTempDir('agentpm-evil-plugin-');
+      await writeFile(
+        path.join(repoDir, 'evil', '.claude-plugin', 'plugin.json'),
+        JSON.stringify({ name: '../../pwned', version: '1.0.0' }),
+      );
+      await writeFile(path.join(repoDir, 'evil', 'commands', 'x.md'), '# x\n');
+
+      const service = new AgentPmService({
+        cwd: projectDir,
+        env: { AGENTPM_HOME: homeDir },
+      });
+      try {
+        await service.addSource(repoDir);
+        // The detected/installed name falls back to the safe directory basename.
+        const installs = await service.install(['evil'], {
+          scope: 'project',
+          yes: true,
+          updateProjectConfig: false,
+        });
+        expect(installs).toHaveLength(1);
+        const resolved = path.resolve(installs[0]!.targetPath);
+        const pluginsRoot = path.resolve(
+          projectDir,
+          '.agentpm',
+          'plugins',
+        );
+        expect(resolved.startsWith(pluginsRoot + path.sep)).toBe(true);
+        expect(installs[0]!.name).not.toContain('..');
       } finally {
         service.close();
       }

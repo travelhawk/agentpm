@@ -210,8 +210,15 @@ export function validateSkillArchive(value: unknown): SkillArchive {
   if (typeof record.name !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/i.test(record.name)) {
     throw new AgentPmError('Skill archive requires a valid "name".');
   }
-  if (typeof record.version !== 'string' || !record.version.trim()) {
-    throw new AgentPmError('Skill archive requires a "version" string.');
+  if (
+    typeof record.version !== 'string' ||
+    !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(record.version.trim())
+  ) {
+    // The version becomes part of an on-disk path on the registry server, so it
+    // must not contain path separators, ':' or '..'.
+    throw new AgentPmError(
+      'Skill archive requires a valid "version" (letters, digits, and . _ + - only).',
+    );
   }
   const kind = record.kind;
   if (kind !== 'skill' && kind !== 'agent' && kind !== 'subagent' && kind !== 'plugin') {

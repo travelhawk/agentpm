@@ -120,6 +120,17 @@ const ENTRY_MARKERS: Record<DetectedGroup['kind'], string[]> = {
 // it natively via `claude plugin marketplace add <dir>`.
 export const AGENTPM_PLUGIN_ROOT = '.agentpm/plugins';
 
+const SAFE_PLUGIN_NAME = /^[a-z0-9][a-z0-9._-]*$/i;
+
+// A plugin name becomes a directory segment under .agentpm/plugins, so it must
+// be a single safe path segment. Untrusted repos can put anything in a
+// manifest, so fall back to the directory basename when the name is unsafe.
+function safePluginName(raw: unknown, pluginRoot: string): string {
+  return typeof raw === 'string' && SAFE_PLUGIN_NAME.test(raw.trim())
+    ? raw.trim()
+    : path.basename(pluginRoot);
+}
+
 async function readJsonFile(filePath: string): Promise<Record<string, unknown> | null> {
   try {
     const parsed: unknown = JSON.parse(await readTextFile(filePath));
@@ -141,11 +152,7 @@ async function detectPluginGroups(rootPath: string): Promise<DetectedGroup[]> {
     if (base === 'plugin.json' && parent === '.claude-plugin') {
       const pluginRoot = path.dirname(path.dirname(filePath));
       const manifest = await readJsonFile(filePath);
-      const name =
-        manifest && typeof manifest.name === 'string' && manifest.name.trim()
-          ? manifest.name.trim()
-          : path.basename(pluginRoot);
-      pluginRoots.set(pluginRoot, name);
+      pluginRoots.set(pluginRoot, safePluginName(manifest?.name, pluginRoot));
     }
   }
 
@@ -174,11 +181,7 @@ async function detectPluginGroups(rootPath: string): Promise<DetectedGroup[]> {
         continue;
       }
       if (!pluginRoots.has(pluginRoot)) {
-        const name =
-          typeof record.name === 'string' && record.name.trim()
-            ? record.name.trim()
-            : path.basename(pluginRoot);
-        pluginRoots.set(pluginRoot, name);
+        pluginRoots.set(pluginRoot, safePluginName(record.name, pluginRoot));
       }
     }
   }
@@ -424,15 +427,19 @@ function createAdapter(id: AdapterId): SkillAdapter {
 
       // Plugins land in AgentPM's managed plugin marketplace directory, which
       // Claude Code consumes via `claude plugin marketplace add <dir>` or
-      // `claude --plugin-dir <dir>/<name>`.
+      // `claude --plugin-dir <dir>/<name>`. Clamp the name to a single safe
+      // segment as defense-in-depth against an unsafe name reaching this far.
       if (entry.kind === 'plugin') {
+        const safeName = SAFE_PLUGIN_NAME.test(entry.name)
+          ? entry.name
+          : path.basename(entry.name);
         return {
-          name: entry.name,
+          name: safeName,
           adapter: id,
           sourceRelativePath: entry.relativePath,
           sourceRootRelativePath,
           targetRelativePath: toPosixPath(
-            path.join(AGENTPM_PLUGIN_ROOT, entry.name),
+            path.join(AGENTPM_PLUGIN_ROOT, safeName),
           ),
         };
       }

@@ -975,6 +975,7 @@ export class AgentPmService {
     previews: UpdatePreview[],
     options: UpdateOptions,
   ): Promise<UpdatePreview[]> {
+    const pluginScopeRoots = new Set<string>();
     for (const preview of previews) {
       if (!preview.changed || !preview.nextLinkTarget) {
         continue;
@@ -1000,8 +1001,12 @@ export class AgentPmService {
           preview.install.targetPath,
           preview.nextLinkTarget,
         );
+        // Both git and archive installs materialize into a per-revision
+        // release under their cache key, so recompute the source-relative path
+        // against that release path.
         const nextSourceRelativePath =
-          preview.install.contentKind === 'git' &&
+          (preview.install.contentKind === 'git' ||
+            preview.install.metadata.archive === true) &&
           preview.install.cacheKey &&
           preview.candidateRevision
             ? path
@@ -1022,11 +1027,29 @@ export class AgentPmService {
           installedRevision: preview.candidateRevision,
           updatedAt: nowIso(),
         });
+
+        const pluginRoot = path.join(
+          preview.install.scopeRoot,
+          AGENTPM_PLUGIN_ROOT,
+        );
+        if (
+          path
+            .resolve(preview.install.targetPath)
+            .startsWith(path.resolve(pluginRoot) + path.sep)
+        ) {
+          pluginScopeRoots.add(preview.install.scopeRoot);
+        }
       } catch (error) {
         throw new AgentPmError(
           `Failed to update "${preview.install.name}": ${error instanceof Error ? error.message : String(error)}`,
         );
       }
+    }
+
+    // Refresh each affected plugin marketplace once so its manifest reflects
+    // the updated plugin versions/descriptions.
+    for (const scopeRoot of pluginScopeRoots) {
+      await this.syncPluginMarketplace(scopeRoot);
     }
 
     return previews;
@@ -2682,9 +2705,12 @@ export class AgentPmService {
       }
 
       if (
+        install.metadata.archive !== true &&
         install.contentKind === 'local' &&
         !(await pathExists(install.contentLocator))
       ) {
+        // Archive installs record contentKind 'local' with an http(s) archive
+        // URL as the locator, so the on-disk existence check does not apply.
         issues.push({
           severity: 'error',
           code: 'source-content-missing',
@@ -2846,18 +2872,30 @@ export class AgentPmService {
     source: Pick<SourceRecord, 'id' | 'locator'>,
     entries: RegistryIndexEntry[],
   ): CatalogEntryRecord[] {
+    const seen = new Set<string>();
     return entries.map((entry) => {
       const location = entry.archive ?? entry.repo ?? '';
+      // Archive URLs change per published version, so key catalog identity by
+      // name plus the stable target/kind/path (never the URL) — installs keep
+      // matching across versions, while same-name-per-target entries stay
+      // distinct instead of colliding on the primary key.
+      const id = makeId(
+        'cat',
+        source.id,
+        entry.name,
+        entry.archive ? 'archive' : location,
+        entry.target ?? entry.adapterHint ?? '',
+        entry.kind ?? '',
+        entry.path ?? '',
+      );
+      if (seen.has(id)) {
+        throw new AgentPmError(
+          `Registry index ${source.locator} has duplicate entries named "${entry.name}" for the same target and path; entry names must be unique per target.`,
+        );
+      }
+      seen.add(id);
       return {
-        // Archive URLs change per version; key catalog identity by name only so
-        // installs keep matching their entry across published versions.
-        id: makeId(
-          'cat',
-          source.id,
-          entry.name,
-          entry.archive ? 'archive' : location,
-          entry.path ?? '',
-        ),
+        id,
         sourceId: source.id,
         name: entry.name,
         description: entry.description ?? null,
@@ -4042,25 +4080,43 @@ export class AgentPmService {
     install: InstallRecord,
     revision: string,
   ): Promise<PreparedContent> {
-    const cacheKey = makeId(
-      'cache',
-      install.contentLocator,
-      install.contentRef ?? 'HEAD',
-    );
+    // Reuse the install's own cache key. Deriving a fresh key from (locator,
+    // ref) diverges from the install-time key whenever the install pinned a
+    // revision (e.g. from `agentpm sync`), which left the materialized release
+    // untracked in cache_repos — so `cache clean` would delete the live
+    // install content. Registering the cache row keeps that sweep away.
+    const cacheKey =
+      install.cacheKey ??
+      makeId('cache', install.contentLocator, install.contentRef ?? 'HEAD');
+    const cacheBasePath = this.cacheBasePath(cacheKey);
     const release = await materializeGitRelease({
       locator: install.contentLocator,
-      basePath: this.cacheBasePath(cacheKey),
+      basePath: cacheBasePath,
       sparsePaths: normalizeSparsePaths([install.sourceRelativePath]),
       ref: install.contentRef,
       revision,
       env: this.env,
     });
+    const report = await inspectRepository(
+      release.releasePath,
+      install.contentLocator,
+      'git',
+    );
+    const existingCache = this.db.getCacheRepo(cacheKey);
+    this.db.saveCacheRepo({
+      cacheKey,
+      sourceId: existingCache?.sourceId ?? install.sourceId,
+      locator: install.contentLocator,
+      kind: 'git',
+      basePath: cacheBasePath,
+      currentRevision: release.revision,
+      isGit: true,
+      layoutSignature: report.layoutSignature,
+      metadata: existingCache?.metadata ?? {},
+      updatedAt: nowIso(),
+    });
     return {
-      report: await inspectRepository(
-        release.releasePath,
-        install.contentLocator,
-        'git',
-      ),
+      report,
       contentKind: 'git',
       contentLocator: install.contentLocator,
       contentRef: install.contentRef,
@@ -4357,6 +4413,17 @@ export class AgentPmService {
     install: InstallRecord,
     source: SourceRecord | null,
   ): Promise<UpdatePreview> {
+    // Registry archive URLs are version-pinned, so only a catalog reindex
+    // surfaces a newer version. Do it here (transient one-off `--from` sources
+    // are skipped by refreshSources), giving archive installs the same live
+    // update behavior as git installs.
+    if (source && source.kind === 'registry') {
+      try {
+        await this.reindexSource(source);
+      } catch {
+        // Fall back to the cached catalog entry / install-time URL below.
+      }
+    }
     // Prefer the freshest catalog entry (refresh replaces archive URLs when a
     // new version is published); fall back to the URL recorded at install time.
     const entry = this.db

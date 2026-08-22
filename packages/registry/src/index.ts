@@ -146,7 +146,17 @@ function httpGet(
         }
         const redirectUrl = new URL(res.headers.location, url).href;
         res.resume();
-        resolve(httpGet(redirectUrl, headers, redirects - 1));
+        // Strip the bearer token on a cross-origin redirect so a registry that
+        // redirects to a CDN or third-party host cannot capture it.
+        let nextHeaders = headers;
+        if (headers && new URL(redirectUrl).origin !== parsed.origin) {
+          nextHeaders = Object.fromEntries(
+            Object.entries(headers).filter(
+              ([key]) => key.toLowerCase() !== 'authorization',
+            ),
+          );
+        }
+        resolve(httpGet(redirectUrl, nextHeaders, redirects - 1));
         return;
       }
       const chunks: Buffer[] = [];

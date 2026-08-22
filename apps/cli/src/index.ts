@@ -228,6 +228,11 @@ function errorGuidance(message: string): string[] {
       'Check repository access, SSH credentials, and the exact locator you passed.',
     );
   }
+  if (/registry|--registry|--token|logged in|Not logged in/i.test(message)) {
+    hints.push(
+      'Log in first with `agentpm registry login <url> --token <token>` (or --username/--password), or pass --registry <url> non-interactively.',
+    );
+  }
   if (hints.length === 0) {
     hints.push(
       'Run `agentpm doctor` for environment checks and `agentpm --help` for command examples.',
@@ -313,8 +318,15 @@ function resolveTarget(value?: string): InstallOptions['target'] {
   if (!value) {
     return undefined;
   }
-  if (value === 'codex' || value === 'claude' || value === 'generic') {
-    return value;
+  // Case-insensitive, matching the multi-agent parseAgents parser so all
+  // --target flags accept the same input.
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === 'codex' ||
+    normalized === 'claude' ||
+    normalized === 'generic'
+  ) {
+    return normalized;
   }
   throw new Error('--target must be one of: codex, claude, generic');
 }
@@ -746,7 +758,8 @@ async function withService<T>(
       options.statusMessages === false
         ? undefined
         : (message) => {
-            console.log(`${symbols.info} ${message}`);
+            // Status goes to stderr so stdout stays valid JSON in --json mode.
+            console.error(`${symbols.info} ${message}`);
           },
   });
   try {
@@ -790,7 +803,7 @@ addExamples(
         flow: QuickstartFlow | undefined,
         flags: { json?: boolean },
       ) => {
-        if (flow && !(flow in QUICKSTART_GUIDES)) {
+        if (flow && !Object.hasOwn(QUICKSTART_GUIDES, flow)) {
           throw new Error(
             `Unknown quickstart flow: ${flow}. Use one of: ${Object.keys(QUICKSTART_GUIDES).join(', ')}.`,
           );
@@ -1009,7 +1022,9 @@ skillsCmd
         console.log(`\n${symbols.info} No skills.sh installs found.\n`);
         return;
       }
-      printUpdates(previews);
+      if (!flags.json) {
+        printUpdates(previews);
+      }
       if (changed.length === 0) {
         if (flags.json) {
           printSuccessJson('skills.update', {
@@ -1469,7 +1484,9 @@ program
           });
           return;
         }
-        printUpdates(previews);
+        if (!flags.json) {
+          printUpdates(previews);
+        }
         if (changed.length === 0) {
           if (flags.json) {
             printSuccessJson('update', {
@@ -1884,7 +1901,9 @@ addExamples(
           });
           return;
         }
-        printDoctor(issues);
+        if (!flags.json) {
+          printDoctor(issues);
+        }
 
         if (!flags.fix) {
           return;
@@ -1902,6 +1921,21 @@ addExamples(
             return;
           }
           console.log(`\n${symbols.success} No errors detected.\n`);
+          return;
+        }
+
+        // In JSON mode without --yes, return the planned fixes instead of
+        // prompting (which would fail without a TTY).
+        if (flags.json && !flags.yes) {
+          const actions = await service.planDoctorFixes(issues);
+          printSuccessJson('doctor', {
+            fixPlanned: true,
+            fixApplied: false,
+            requiresConfirmation: true,
+            issues,
+            actions,
+            results: [],
+          });
           return;
         }
 
@@ -1935,7 +1969,9 @@ addExamples(
           });
           return;
         }
-        printDoctorFixes(actions, issues);
+        if (!flags.json) {
+          printDoctorFixes(actions, issues);
+        }
         if (actions.length === 0) {
           if (flags.json) {
             printSuccessJson('doctor', {
@@ -2103,10 +2139,12 @@ addExamples(
         let username = flags.username;
         let password = flags.password;
         if (!flags.token && !username) {
-          username = await promptToInput('Username:');
+          username = await promptToInput('Username');
         }
         if (!flags.token && username && !password) {
-          password = await promptToInput(`Password for ${username}:`);
+          password = await promptToInput(`Password for ${username}`, {
+            mask: true,
+          });
         }
         const result = await registryLogin({
           url,
@@ -2115,7 +2153,7 @@ addExamples(
           token: flags.token,
         });
         if (flags.json) {
-          printSuccessJson('registry-login', { ...result });
+          printSuccessJson('registry.login', { result });
           return;
         }
         console.log(
@@ -2138,7 +2176,7 @@ addExamples(
     .action(async (url: string, flags: { json?: boolean }) => {
       const removed = await registryLogout(url);
       if (flags.json) {
-        printSuccessJson('registry-logout', { removed });
+        printSuccessJson('registry.logout', { removed });
         return;
       }
       console.log(
@@ -2160,7 +2198,7 @@ addExamples(
       const resolved = await resolveRegistryUrl(url);
       const result = await registryWhoami(resolved);
       if (flags.json) {
-        printSuccessJson('registry-whoami', { ...result });
+        printSuccessJson('registry.whoami', { result });
         return;
       }
       console.log(
@@ -2181,6 +2219,7 @@ addExamples(
     .option('--visibility <visibility>', 'public or private')
     .option('--tag <tag>', 'Add a tag (repeatable)', collect, [])
     .option('--target <agent>', 'Preferred agent layout: codex, claude, or generic')
+    .option('--kind <kind>', 'Force the entry kind: skill, agent, subagent, or plugin')
     .option('--description <text>', 'Override the description')
     .option('--json', 'Print machine-readable JSON')
     .action(
@@ -2193,6 +2232,7 @@ addExamples(
           visibility?: string;
           tag: string[];
           target?: string;
+          kind?: string;
           description?: string;
           json?: boolean;
         },
@@ -2204,6 +2244,12 @@ addExamples(
         ) {
           throw new Error('--visibility must be "public" or "private".');
         }
+        if (
+          flags.kind &&
+          !['skill', 'agent', 'subagent', 'plugin'].includes(flags.kind)
+        ) {
+          throw new Error('--kind must be skill, agent, subagent, or plugin.');
+        }
         const registryUrl = await resolveRegistryUrl(flags.registry);
         const result = await publishSkillToRegistry({
           registryUrl,
@@ -2213,10 +2259,16 @@ addExamples(
           visibility: flags.visibility as 'public' | 'private' | undefined,
           tags: flags.tag.length > 0 ? flags.tag : undefined,
           target: parseAgent(flags.target),
+          kind: flags.kind as
+            | 'skill'
+            | 'agent'
+            | 'subagent'
+            | 'plugin'
+            | undefined,
           description: flags.description,
         });
         if (flags.json) {
-          printSuccessJson('registry-publish', { ...result });
+          printSuccessJson('registry.publish', { result });
           return;
         }
         console.log(
@@ -2269,7 +2321,7 @@ addExamples(
           },
         });
         if (flags.json) {
-          printSuccessJson('registry-user-add', { ...response });
+          printSuccessJson('registry.user.add', { user: response });
           return;
         }
         console.log(
@@ -2301,7 +2353,7 @@ addExamples(
       });
       const users = Array.isArray(response.users) ? response.users : [];
       if (flags.json) {
-        printSuccessJson('registry-user-list', { users });
+        printSuccessJson('registry.user.list', { users });
         return;
       }
       section('Registry Users');
@@ -2318,8 +2370,9 @@ addExamples(
 const AGENT_GUIDE = `# AgentPM — guide for AI agents
 
 AgentPM manages skills, agents, and Claude Code plugins across native layouts
-(.codex/skills, .claude/skills, .agents/skills, .agentpm/plugins). Every command
-supports --json for machine-readable output and --yes to skip prompts.
+(.codex/skills, .claude/skills, .agents/skills, .agentpm/plugins). Most commands
+support --json for machine-readable output, and commands that prompt accept
+--yes to skip prompts (check \`agentpm <command> --help\`).
 
 ## Discover & install skills
 - agentpm skills search <query> --json          # public skills (skills.sh)
@@ -2328,15 +2381,17 @@ supports --json for machine-readable output and --yes to skip prompts.
 - agentpm source skills <source> --json         # list installable entries
 - agentpm install <name> --target claude --project --yes --json
 - agentpm list --json                           # installed state
-- agentpm update --apply --yes --json           # update installs
-- agentpm remove <name> --yes --json
+- agentpm update --yes --json                   # preview and apply updates
+- agentpm remove <name> --json
 
 ## Claude Code plugins
 Repos with .claude-plugin/plugin.json or marketplace.json are indexed as
 plugins. Installing one places it in <scope>/.agentpm/plugins/<name> and keeps
 that folder valid as a Claude Code marketplace. Enable it with:
 - claude plugin marketplace add <scope>/.agentpm/plugins   (once)
-- claude plugin install <name>@agentpm
+- claude plugin install <name>@agentpm            # global scope
+- claude plugin install <name>@agentpm-<folder>   # project scope
+The exact enable command is printed after install.
 
 ## Team contract
 - agentpm init --json     # write agentpm.yaml describing required skills

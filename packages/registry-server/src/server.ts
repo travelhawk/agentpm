@@ -155,6 +155,37 @@ export function createRegistryServer(options: RegistryServerOptions): RegistrySe
     bootstrap = { username: admin.username, password, token };
   }
 
+  // In-memory login throttle: after too many failures for an (ip, username)
+  // pair within the window, further attempts are rejected until it expires.
+  const loginFailures = new Map<string, { count: number; windowStart: number }>();
+  const LOGIN_MAX_FAILURES = 10;
+  const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+  function loginKey(req: http.IncomingMessage, username: string): string {
+    return `${req.socket.remoteAddress ?? 'unknown'}|${username}`;
+  }
+
+  function isLoginBlocked(key: string, nowMs: number): boolean {
+    const entry = loginFailures.get(key);
+    if (!entry) {
+      return false;
+    }
+    if (nowMs - entry.windowStart > LOGIN_WINDOW_MS) {
+      loginFailures.delete(key);
+      return false;
+    }
+    return entry.count >= LOGIN_MAX_FAILURES;
+  }
+
+  function recordLoginFailure(key: string, nowMs: number): void {
+    const entry = loginFailures.get(key);
+    if (!entry || nowMs - entry.windowStart > LOGIN_WINDOW_MS) {
+      loginFailures.set(key, { count: 1, windowStart: nowMs });
+      return;
+    }
+    entry.count += 1;
+  }
+
   function authenticate(req: http.IncomingMessage): AuthContext | null {
     const header = req.headers.authorization;
     if (!header || !header.toLowerCase().startsWith('bearer ')) {
@@ -243,6 +274,12 @@ export function createRegistryServer(options: RegistryServerOptions): RegistrySe
     }
 
     if (method === 'GET' && (pathname === '/index.json' || pathname === '/v1/index.json')) {
+      // With publicRead off, an unauthenticated read is a 401 (not an empty
+      // list) so the client can prompt for a login instead of silently
+      // indexing zero entries.
+      if (!publicRead && !auth) {
+        throw new HttpError(401, 'This registry requires authentication.');
+      }
       const entries: RegistryIndexEntry[] = [];
       for (const skill of visibleSkills(auth)) {
         const versions = db.listSkillVersions(skill.id);
@@ -253,7 +290,9 @@ export function createRegistryServer(options: RegistryServerOptions): RegistrySe
         entries.push({
           name: skill.name,
           description: skill.description ?? undefined,
-          archive: `v1/skills/${encodeURIComponent(skill.name)}/versions/${encodeURIComponent(latest.version)}/archive`,
+          // Root-absolute so it resolves identically whether the index was
+          // fetched at /index.json or /v1/index.json.
+          archive: `/v1/skills/${encodeURIComponent(skill.name)}/versions/${encodeURIComponent(latest.version)}/archive`,
           version: latest.version,
           kind: skill.kind as RegistryIndexEntry['kind'],
           target: (skill.target ?? undefined) as RegistryIndexEntry['target'],
@@ -268,10 +307,21 @@ export function createRegistryServer(options: RegistryServerOptions): RegistrySe
       const body = await readJsonBody(req, 1024 * 64);
       const username = typeof body.username === 'string' ? body.username.trim() : '';
       const password = typeof body.password === 'string' ? body.password : '';
+      const key = loginKey(req, username);
+      const nowMs = Date.now();
+      if (isLoginBlocked(key, nowMs)) {
+        throw new HttpError(429, 'Too many failed login attempts. Try again later.');
+      }
       const user = username ? db.getUserByUsername(username) : null;
-      if (!user || !user.active || !verifyPassword(password, user.passwordHash)) {
+      const ok =
+        user !== null &&
+        user.active &&
+        (await verifyPassword(password, user.passwordHash));
+      if (!user || !user.active || !ok) {
+        recordLoginFailure(key, nowMs);
         throw new HttpError(401, 'Invalid username or password.');
       }
+      loginFailures.delete(key);
       const token = generateToken();
       const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : 'login';
       const record = db.createToken(user.id, hashToken(token), label);
@@ -381,6 +431,11 @@ export function createRegistryServer(options: RegistryServerOptions): RegistrySe
 
         const existing = db.getSkillByName(name);
         if (existing && !canManageSkill(existing, context)) {
+          // Don't confirm existence/ownership of a skill the caller cannot
+          // otherwise see: a hidden private skill reads as "not found".
+          if (!canReadSkill(existing, auth)) {
+            throw new HttpError(404, `Skill not found: ${name}`);
+          }
           throw new HttpError(403, `Skill "${name}" is owned by another user.`);
         }
         if (existing && db.getSkillVersion(existing.id, archive.version)) {
@@ -411,6 +466,12 @@ export function createRegistryServer(options: RegistryServerOptions): RegistrySe
         const archiveDir = path.join(archivesDir, skill.name);
         await fs.mkdir(archiveDir, { recursive: true });
         const archivePath = path.join(archiveDir, `${archive.version}.json`);
+        // Defense-in-depth: the version is validated, but confirm the derived
+        // path stays inside the archive tree before writing.
+        const relArchive = path.relative(archivesDir, archivePath);
+        if (relArchive.startsWith('..') || path.isAbsolute(relArchive)) {
+          throw new HttpError(400, `Invalid version: ${archive.version}`);
+        }
         await fs.writeFile(archivePath, serialized, 'utf8');
 
         const version = db.addSkillVersion({
@@ -715,7 +776,12 @@ export async function startRegistryServer(
   });
   const address = handle.server.address();
   const actualPort = typeof address === 'object' && address ? address.port : port;
-  const displayHost = host === '0.0.0.0' || host === '::' ? 'localhost' : host;
+  const displayHost =
+    host === '0.0.0.0' || host === '::'
+      ? 'localhost'
+      : host.includes(':')
+        ? `[${host}]`
+        : host;
   handle.url = `http://${displayHost}:${actualPort}`;
   return handle;
 }

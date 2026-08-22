@@ -43,7 +43,7 @@ of truth for content, updates, and provenance.
 
 ## Updating and removing
 
-- `agentpm update --apply` refreshes plugin content like any other install.
+- `agentpm update --yes` refreshes plugin content like any other install.
 - `agentpm remove <name>` removes the managed link and rewrites the
   marketplace manifest (the manifest disappears when the last plugin is
   removed).

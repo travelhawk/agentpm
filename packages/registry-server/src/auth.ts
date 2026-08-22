@@ -1,4 +1,13 @@
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import {
+  createHash,
+  randomBytes,
+  scrypt,
+  scryptSync,
+  timingSafeEqual,
+} from 'node:crypto';
+import { promisify } from 'node:util';
+
+const scryptAsync = promisify(scrypt);
 
 export const TOKEN_PREFIX = 'agpm_';
 
@@ -8,14 +17,19 @@ export function hashPassword(password: string): string {
   return `scrypt:${salt}:${derived}`;
 }
 
-export function verifyPassword(password: string, stored: string): boolean {
+// Async so a burst of login attempts cannot serialize scrypt work on the
+// single HTTP thread and stall every other request.
+export async function verifyPassword(
+  password: string,
+  stored: string,
+): Promise<boolean> {
   const parts = stored.split(':');
   if (parts.length !== 3 || parts[0] !== 'scrypt') {
     return false;
   }
   const [, salt, expectedHex] = parts;
   const expected = Buffer.from(expectedHex!, 'hex');
-  const derived = scryptSync(password, salt!, expected.length);
+  const derived = (await scryptAsync(password, salt!, expected.length)) as Buffer;
   return derived.length === expected.length && timingSafeEqual(derived, expected);
 }
 
