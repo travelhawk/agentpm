@@ -95,6 +95,10 @@ Add `--target codex,claude,generic` to control which runtimes receive pulled ski
 
 AgentPM is safe to drive from another coding agent when the agent avoids prompt-driven flows. Use explicit selectors, explicit targets, `--yes` for confirmations, `--all` for bulk push, and `--json` whenever output will be parsed.
 
+The fastest way to onboard an agent: tell it to run `agentpm guide` (or
+`agentpm guide --json`). It prints a compact, agent-oriented reference for
+discovery, installs, plugins, the team contract, and the self-hosted registry.
+
 Copy this prompt into an AI coding agent that has shell access:
 
 ```text
@@ -147,11 +151,47 @@ agentpm doctor --fix --yes --json
 ## What AgentPM Does Well
 
 - `📦` Install skills from Git repositories, local folders, static registries, and the public `skills.sh` bridge.
+- `🔌` Install Claude Code plugins (`.claude-plugin/plugin.json` and marketplace repos) into a managed local marketplace Claude Code consumes natively.
+- `🏠` Run your own registry with `agentpm registry serve`: users, API tokens, public/private skills, publish/install, and a built-in web UI for curation.
 - `🧭` Keep the CLI thin while respecting native agent layouts instead of rewriting them.
 - `🤝` Turn `agentpm.yaml` into a reproducible team contract for repo-scoped skills.
 - `🔁` Publish a canonical `skills/<name>` library with `push`, then materialize it everywhere with `pull`.
 - `🩺` Explain broken state with `doctor` and clean stale cache data with `cache clean`.
 - `🧾` Emit machine-readable JSON with `--json` across stateful automation flows.
+
+## Self-Hosted Registry
+
+Share skills and plugins with your team under your own control — who can read,
+who can publish, and what stays private:
+
+```bash
+agentpm registry serve                # starts the server + web UI on :7420
+agentpm registry login http://localhost:7420 --token <token-from-first-run>
+agentpm registry publish ./my-skill   # automatic patch-version bump
+agentpm registry user add teammate --role publisher
+
+# On any other machine:
+agentpm source add registry:https://skills.example.com/index.json
+agentpm install my-skill
+```
+
+The web UI at the server root lets you browse and search skills, read their
+docs, copy install commands, toggle public/private visibility, and manage
+users and API tokens. See `docs/registry-guide.md` for the full picture.
+
+## Claude Code Plugins
+
+Repos containing `.claude-plugin/plugin.json` (or a marketplace manifest) are
+indexed as plugins. `agentpm install <plugin>` places the plugin under
+`<scope>/.agentpm/plugins/<name>` and maintains a marketplace manifest there,
+so Claude Code can use it natively:
+
+```bash
+claude plugin marketplace add ~/.agentpm/plugins   # once
+claude plugin install <name>@agentpm
+```
+
+See `docs/plugin-guide.md` for details.
 
 ## Common Flows
 

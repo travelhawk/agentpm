@@ -44,8 +44,12 @@ pnpm + Turborepo monorepo. The CLI is intentionally thin; nearly all behavior li
   `skills/`, and `subagents/`. Generic installs from plain `skills/` land in `.agents/skills/`.
 - `packages/git` — `simple-git` wrapper with an interactive runner for operations that may
   prompt for SSH/passphrase; manages cached repo checkouts under the cache dir.
-- `packages/registry` — loads static local/HTTP YAML/JSON registry indexes (private HTTP
-  indexes use `AGENTPM_REGISTRY_TOKEN` or host-specific bearer tokens).
+- `packages/registry` — loads static local/HTTP YAML/JSON registry indexes, downloads
+  skill archives, and manages per-origin registry credentials (env bearer tokens
+  `AGENTPM_REGISTRY_TOKEN[_<HOST>]` take precedence over `credentials.json`).
+- `packages/registry-server` — self-hosted registry server (`agentpm registry serve`):
+  node:http + node:sqlite, users/tokens/roles, public/private skills, JSON skill
+  archives, embedded web UI for browsing/curation/user management.
 - `packages/db` — persistent install state / manifest records under `AGENTPM_HOME`.
 - `packages/fs` — cross-platform filesystem helpers.
 - `packages/shared` — shared types and locator classification (`github:owner/repo`,
