@@ -10,7 +10,7 @@ export type ContentKind = 'git' | 'local';
 export type InstallScope = 'global' | 'project' | 'workspace';
 export type LocalInstallScope = Exclude<InstallScope, 'global'>;
 export type AdapterId = 'generic' | 'codex' | 'claude';
-export type EntryKind = 'skill' | 'agent' | 'subagent';
+export type EntryKind = 'skill' | 'agent' | 'subagent' | 'plugin';
 export type LayoutMigrationRisk = 'safe' | 'remap' | 'breaking';
 export type DiffKind = 'added' | 'removed' | 'changed';
 export type DoctorSeverity = 'info' | 'warning' | 'error';
@@ -145,7 +145,10 @@ export interface AdapterUpdateResult {
 export interface RegistryIndexEntry {
   name: string;
   description?: string | undefined;
-  repo: string;
+  repo?: string | undefined;
+  archive?: string | undefined;
+  version?: string | undefined;
+  kind?: EntryKind | undefined;
   ref?: string | undefined;
   path?: string | undefined;
   adapterHint?: AdapterId | undefined;
@@ -156,6 +159,117 @@ export interface RegistryIndexEntry {
 export interface RegistryIndexFile {
   version: number;
   entries: RegistryIndexEntry[];
+}
+
+export const SKILL_ARCHIVE_FORMAT_VERSION = 1;
+
+export type SkillArchiveFileEncoding = 'utf8' | 'base64';
+
+export interface SkillArchiveFile {
+  path: string;
+  encoding: SkillArchiveFileEncoding;
+  content: string;
+  executable?: boolean | undefined;
+}
+
+export interface SkillArchive {
+  formatVersion: number;
+  name: string;
+  version: string;
+  kind: EntryKind;
+  target?: AdapterId | undefined;
+  description?: string | undefined;
+  tags?: string[] | undefined;
+  files: SkillArchiveFile[];
+}
+
+const SAFE_ARCHIVE_SEGMENT = /^[^\\/:\0]+$/;
+
+export function assertSafeArchivePath(relativePath: string): void {
+  if (!relativePath || relativePath.startsWith('/') || /^[a-zA-Z]:/.test(relativePath)) {
+    throw new AgentPmError(`Archive contains an unsafe file path: ${relativePath}`);
+  }
+  const segments = relativePath.split('/');
+  for (const segment of segments) {
+    if (segment === '.' || segment === '..' || !SAFE_ARCHIVE_SEGMENT.test(segment)) {
+      throw new AgentPmError(`Archive contains an unsafe file path: ${relativePath}`);
+    }
+  }
+}
+
+export function validateSkillArchive(value: unknown): SkillArchive {
+  if (!value || typeof value !== 'object') {
+    throw new AgentPmError('Skill archive must be a JSON object.');
+  }
+  const record = value as Record<string, unknown>;
+  if (record.formatVersion !== SKILL_ARCHIVE_FORMAT_VERSION) {
+    throw new AgentPmError(
+      `Unsupported skill archive format version: ${String(record.formatVersion)}`,
+    );
+  }
+  if (typeof record.name !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/i.test(record.name)) {
+    throw new AgentPmError('Skill archive requires a valid "name".');
+  }
+  if (typeof record.version !== 'string' || !record.version.trim()) {
+    throw new AgentPmError('Skill archive requires a "version" string.');
+  }
+  const kind = record.kind;
+  if (kind !== 'skill' && kind !== 'agent' && kind !== 'subagent' && kind !== 'plugin') {
+    throw new AgentPmError('Skill archive "kind" must be skill, agent, subagent, or plugin.');
+  }
+  const target = record.target;
+  if (
+    target !== undefined &&
+    target !== null &&
+    target !== 'codex' &&
+    target !== 'claude' &&
+    target !== 'generic'
+  ) {
+    throw new AgentPmError('Skill archive "target" must be codex, claude, or generic.');
+  }
+  if (!Array.isArray(record.files) || record.files.length === 0) {
+    throw new AgentPmError('Skill archive must include at least one file.');
+  }
+  const seenPaths = new Set<string>();
+  const files: SkillArchiveFile[] = record.files.map((file) => {
+    if (!file || typeof file !== 'object') {
+      throw new AgentPmError('Skill archive files must be objects.');
+    }
+    const fileRecord = file as Record<string, unknown>;
+    if (typeof fileRecord.path !== 'string') {
+      throw new AgentPmError('Skill archive files require a string "path".');
+    }
+    assertSafeArchivePath(fileRecord.path);
+    if (seenPaths.has(fileRecord.path)) {
+      throw new AgentPmError(`Skill archive contains duplicate path: ${fileRecord.path}`);
+    }
+    seenPaths.add(fileRecord.path);
+    if (fileRecord.encoding !== 'utf8' && fileRecord.encoding !== 'base64') {
+      throw new AgentPmError('Skill archive file encoding must be utf8 or base64.');
+    }
+    if (typeof fileRecord.content !== 'string') {
+      throw new AgentPmError('Skill archive files require string "content".');
+    }
+    return {
+      path: fileRecord.path,
+      encoding: fileRecord.encoding,
+      content: fileRecord.content,
+      executable: fileRecord.executable === true ? true : undefined,
+    };
+  });
+
+  return {
+    formatVersion: SKILL_ARCHIVE_FORMAT_VERSION,
+    name: record.name,
+    version: record.version.trim(),
+    kind,
+    target: (target ?? undefined),
+    description: typeof record.description === 'string' ? record.description : undefined,
+    tags: Array.isArray(record.tags)
+      ? record.tags.filter((tag): tag is string => typeof tag === 'string')
+      : undefined,
+    files,
+  };
 }
 
 export interface ManifestSourceSpec {

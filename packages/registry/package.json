@@ -11,6 +11,7 @@
     "build": "tsup src/index.ts --format esm --target node24 --clean --dts --tsconfig tsconfig.build.json"
   },
   "dependencies": {
+    "@agentpm/fs": "workspace:*",
     "@agentpm/shared": "workspace:*",
     "js-yaml": "^4.1.0"
   }

@@ -58,6 +58,8 @@
   },
   "devDependencies": {
     "@agentpm/core": "workspace:*",
+    "@agentpm/registry": "workspace:*",
+    "@agentpm/registry-server": "workspace:*",
     "@agentpm/ui": "workspace:*"
   }
 }

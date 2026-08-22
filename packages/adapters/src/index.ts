@@ -1,6 +1,11 @@
 import path from 'node:path';
 
-import { listChildDirectories, pathExists, walkFiles } from '@agentpm/fs';
+import {
+  listChildDirectories,
+  pathExists,
+  readTextFile,
+  walkFiles,
+} from '@agentpm/fs';
 import {
   AgentPmError,
   stableHash,
@@ -104,7 +109,111 @@ const ENTRY_MARKERS: Record<DetectedGroup['kind'], string[]> = {
   skill: ['SKILL.md'],
   subagent: ['SKILL.md'],
   agent: ['README.md', 'AGENT.md', 'CLAUDE.md'],
+  // Plugins are detected by dedicated marker logic (.claude-plugin/plugin.json),
+  // not by the generic layout scan.
+  plugin: [],
 };
+
+// Directory (relative to the scope root) where AgentPM keeps installed Claude
+// Code plugins. The folder doubles as a local plugin marketplace: AgentPM
+// maintains a .claude-plugin/marketplace.json in it so Claude Code can consume
+// it natively via `claude plugin marketplace add <dir>`.
+export const AGENTPM_PLUGIN_ROOT = '.agentpm/plugins';
+
+async function readJsonFile(filePath: string): Promise<Record<string, unknown> | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readTextFile(filePath));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function detectPluginGroups(rootPath: string): Promise<DetectedGroup[]> {
+  const files = await walkFiles(rootPath);
+  const pluginRoots = new Map<string, string>();
+
+  for (const filePath of files) {
+    const base = path.basename(filePath);
+    const parent = path.basename(path.dirname(filePath));
+    if (base === 'plugin.json' && parent === '.claude-plugin') {
+      const pluginRoot = path.dirname(path.dirname(filePath));
+      const manifest = await readJsonFile(filePath);
+      const name =
+        manifest && typeof manifest.name === 'string' && manifest.name.trim()
+          ? manifest.name.trim()
+          : path.basename(pluginRoot);
+      pluginRoots.set(pluginRoot, name);
+    }
+  }
+
+  // Marketplace manifests can list plugins by relative path; index those too so
+  // a marketplace repo exposes its plugins even without per-plugin manifests.
+  for (const filePath of files) {
+    const base = path.basename(filePath);
+    const parent = path.basename(path.dirname(filePath));
+    if (base !== 'marketplace.json' || parent !== '.claude-plugin') {
+      continue;
+    }
+    const marketplaceRoot = path.dirname(path.dirname(filePath));
+    const manifest = await readJsonFile(filePath);
+    const plugins = Array.isArray(manifest?.plugins) ? manifest.plugins : [];
+    for (const rawEntry of plugins) {
+      if (!rawEntry || typeof rawEntry !== 'object') {
+        continue;
+      }
+      const record = rawEntry as Record<string, unknown>;
+      const source = record.source;
+      if (typeof source !== 'string' || !source.startsWith('.')) {
+        continue;
+      }
+      const pluginRoot = path.resolve(marketplaceRoot, source);
+      if (!(await pathExists(pluginRoot))) {
+        continue;
+      }
+      if (!pluginRoots.has(pluginRoot)) {
+        const name =
+          typeof record.name === 'string' && record.name.trim()
+            ? record.name.trim()
+            : path.basename(pluginRoot);
+        pluginRoots.set(pluginRoot, name);
+      }
+    }
+  }
+
+  if (pluginRoots.size === 0) {
+    return [];
+  }
+
+  const entries: DetectedEntry[] = [...pluginRoots.entries()]
+    .map(([pluginRoot, name]): DetectedEntry => {
+      const relative = path.relative(rootPath, pluginRoot);
+      const relativePath = relative === '' ? '.' : toPosixPath(relative);
+      return {
+        name,
+        relativePath,
+        rootRelativePath: relativePath,
+        adapter: 'claude',
+        kind: 'plugin',
+        warnings: [],
+      };
+    })
+    .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+
+  return [
+    {
+      adapter: 'claude',
+      label: 'Claude Code plugins',
+      relativeRoot: '',
+      kind: 'plugin',
+      nativeTargetRelativeRoot: AGENTPM_PLUGIN_ROOT,
+      confidence: 100,
+      entries,
+    },
+  ];
+}
 
 function isNestedWithin(parentPath: string, candidatePath: string): boolean {
   const relativePath = path.relative(parentPath, candidatePath);
@@ -278,7 +387,11 @@ function createAdapter(id: AdapterId): SkillAdapter {
       const groups = await Promise.all(
         layouts.map((layout) => detectGroupsForLayout(rootPath, layout)),
       );
-      return groups.flat();
+      const flattened = groups.flat();
+      if (id === 'claude') {
+        flattened.push(...(await detectPluginGroups(rootPath)));
+      }
+      return flattened;
     },
     scoreCompatibility(report: InspectionReport): AdapterCompatibility {
       return buildCompatibility(id, report.groups);
@@ -306,6 +419,21 @@ function createAdapter(id: AdapterId): SkillAdapter {
           sourceRelativePath: entry.relativePath,
           sourceRootRelativePath,
           targetRelativePath: toPosixPath(path.join(SKILL_ROOTS[id], subPath)),
+        };
+      }
+
+      // Plugins land in AgentPM's managed plugin marketplace directory, which
+      // Claude Code consumes via `claude plugin marketplace add <dir>` or
+      // `claude --plugin-dir <dir>/<name>`.
+      if (entry.kind === 'plugin') {
+        return {
+          name: entry.name,
+          adapter: id,
+          sourceRelativePath: entry.relativePath,
+          sourceRootRelativePath,
+          targetRelativePath: toPosixPath(
+            path.join(AGENTPM_PLUGIN_ROOT, entry.name),
+          ),
         };
       }
 

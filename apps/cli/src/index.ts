@@ -1,15 +1,29 @@
+import os from 'node:os';
+import path from 'node:path';
+
 import { Command } from 'commander';
 
 import {
   AgentPmService,
+  publishSkillToRegistry,
+  registryLogin,
+  registryLogout,
+  registryWhoami,
   type InstallOptions,
   type ProviderInstalledSkillRecord,
   type ProviderSkillSearchResult,
   type UpdateOptions,
 } from '@agentpm/core';
+import {
+  loadRegistryCredentials,
+  registryApiRequest,
+  getRegistryToken,
+} from '@agentpm/registry';
+import { startRegistryServer } from '@agentpm/registry-server';
 import { createPromptApi, promptToConfirm, promptToInput } from '@agentpm/ui';
 
 import { resolveTargetAddArgs } from './target-add.js';
+
 
 type AgentId = 'codex' | 'claude' | 'generic';
 type ScopeId = 'global' | 'project' | 'workspace';
@@ -1972,6 +1986,389 @@ addExamples(
       });
     }),
   ['agentpm doctor', 'agentpm doctor --fix'],
+);
+
+async function resolveRegistryUrl(explicit?: string): Promise<string> {
+  if (explicit) {
+    return explicit;
+  }
+  const credentials = await loadRegistryCredentials();
+  const origins = Object.keys(credentials.registries);
+  if (origins.length === 1) {
+    return origins[0]!;
+  }
+  if (origins.length === 0) {
+    throw new Error(
+      'No registry configured. Pass --registry <url> or run `agentpm registry login <url>` first.',
+    );
+  }
+  throw new Error(
+    `Multiple registries configured (${origins.join(', ')}). Pass --registry <url> to choose one.`,
+  );
+}
+
+function defaultRegistryDataDir(): string {
+  const home = process.env.AGENTPM_HOME?.trim()
+    ? path.resolve(process.env.AGENTPM_HOME)
+    : path.join(os.homedir(), '.agentpm');
+  return path.join(home, 'registry');
+}
+
+const registryCmd = addExamples(
+  program
+    .command('registry')
+    .description('Run and use a self-hosted AgentPM registry'),
+  [
+    'agentpm registry serve --port 7420',
+    'agentpm registry login http://localhost:7420 --username admin --password <pw>',
+    'agentpm registry publish ./my-skill',
+    'agentpm source add registry:http://localhost:7420/index.json',
+  ],
+);
+
+addExamples(
+  registryCmd
+    .command('serve')
+    .description('Start a self-hosted skill registry with a web UI')
+    .option('--port <port>', 'Port to listen on', '7420')
+    .option('--host <host>', 'Host to bind', '127.0.0.1')
+    .option('--data-dir <dir>', 'Directory for registry data (default: ~/.agentpm/registry)')
+    .option('--private', 'Require an API token even for public skills')
+    .action(
+      async (flags: {
+        port: string;
+        host: string;
+        dataDir?: string;
+        private?: boolean;
+      }) => {
+        const handle = await startRegistryServer({
+          dataDir: flags.dataDir ?? defaultRegistryDataDir(),
+          host: flags.host,
+          port: Number(flags.port),
+          publicRead: !flags.private,
+        });
+        section('AgentPM Registry');
+        console.log(`  ${symbols.success} Listening on ${style.cyan(handle.url)}`);
+        console.log(`  ${symbols.bullet} Web UI:  ${handle.url}/`);
+        console.log(`  ${symbols.bullet} Index:   ${handle.url}/index.json`);
+        console.log(`  ${symbols.bullet} API:     ${handle.url}/v1/`);
+        if (handle.bootstrap) {
+          console.log('');
+          console.log(
+            `  ${style.bold('First run — admin account created (shown only once):')}`,
+          );
+          console.log(`    username: ${handle.bootstrap.username}`);
+          console.log(`    password: ${handle.bootstrap.password}`);
+          console.log(`    token:    ${handle.bootstrap.token}`);
+          console.log('');
+          console.log(
+            `  ${symbols.arrow} Log in: ${style.cyan(`agentpm registry login ${handle.url} --token ${handle.bootstrap.token}`)}`,
+          );
+        }
+        console.log('');
+        console.log(`  Press Ctrl+C to stop.`);
+        const shutdown = () => {
+          void handle.close().finally(() => process.exit(0));
+        };
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+        // Keep the process attached to the server until it is closed.
+        await new Promise<void>((resolve) => {
+          handle.server.on('close', resolve);
+        });
+      },
+    ),
+  ['agentpm registry serve', 'agentpm registry serve --host 0.0.0.0 --port 8080'],
+);
+
+addExamples(
+  registryCmd
+    .command('login')
+    .description('Store credentials for a registry')
+    .argument('<url>', 'Registry base URL, e.g. http://localhost:7420')
+    .option('--username <username>', 'Registry username')
+    .option('--password <password>', 'Registry password')
+    .option('--token <token>', 'Existing API token (skips username/password)')
+    .option('--json', 'Print machine-readable JSON')
+    .action(
+      async (
+        url: string,
+        flags: {
+          username?: string;
+          password?: string;
+          token?: string;
+          json?: boolean;
+        },
+      ) => {
+        let username = flags.username;
+        let password = flags.password;
+        if (!flags.token && !username) {
+          username = await promptToInput('Username:');
+        }
+        if (!flags.token && username && !password) {
+          password = await promptToInput(`Password for ${username}:`);
+        }
+        const result = await registryLogin({
+          url,
+          username,
+          password,
+          token: flags.token,
+        });
+        if (flags.json) {
+          printSuccessJson('registry-login', { ...result });
+          return;
+        }
+        console.log(
+          `${symbols.success} Logged in to ${result.origin} as ${style.bold(result.username)} (${result.role}).`,
+        );
+      },
+    ),
+  [
+    'agentpm registry login http://localhost:7420 --username admin --password <pw>',
+    'agentpm registry login https://skills.example.com --token agpm_xxx',
+  ],
+);
+
+addExamples(
+  registryCmd
+    .command('logout')
+    .description('Remove stored credentials for a registry')
+    .argument('<url>', 'Registry base URL')
+    .option('--json', 'Print machine-readable JSON')
+    .action(async (url: string, flags: { json?: boolean }) => {
+      const removed = await registryLogout(url);
+      if (flags.json) {
+        printSuccessJson('registry-logout', { removed });
+        return;
+      }
+      console.log(
+        removed
+          ? `${symbols.success} Logged out.`
+          : `${symbols.info} No stored credentials for that registry.`,
+      );
+    }),
+  ['agentpm registry logout http://localhost:7420'],
+);
+
+addExamples(
+  registryCmd
+    .command('whoami')
+    .description('Show the authenticated registry user')
+    .argument('[url]', 'Registry base URL (default: the only configured registry)')
+    .option('--json', 'Print machine-readable JSON')
+    .action(async (url: string | undefined, flags: { json?: boolean }) => {
+      const resolved = await resolveRegistryUrl(url);
+      const result = await registryWhoami(resolved);
+      if (flags.json) {
+        printSuccessJson('registry-whoami', { ...result });
+        return;
+      }
+      console.log(
+        `${symbols.success} ${result.origin}: ${style.bold(result.username)} (${result.role})`,
+      );
+    }),
+  ['agentpm registry whoami'],
+);
+
+addExamples(
+  registryCmd
+    .command('publish')
+    .description('Pack a skill or plugin folder and publish it to a registry')
+    .argument('<path>', 'Folder containing the skill (SKILL.md) or plugin')
+    .option('--registry <url>', 'Registry base URL (default: the only configured registry)')
+    .option('--name <name>', 'Override the published name (default: folder name)')
+    .option('--version <version>', 'Version to publish (default: bump latest patch)')
+    .option('--visibility <visibility>', 'public or private')
+    .option('--tag <tag>', 'Add a tag (repeatable)', collect, [])
+    .option('--target <agent>', 'Preferred agent layout: codex, claude, or generic')
+    .option('--description <text>', 'Override the description')
+    .option('--json', 'Print machine-readable JSON')
+    .action(
+      async (
+        sourcePath: string,
+        flags: {
+          registry?: string;
+          name?: string;
+          version?: string;
+          visibility?: string;
+          tag: string[];
+          target?: string;
+          description?: string;
+          json?: boolean;
+        },
+      ) => {
+        if (
+          flags.visibility &&
+          flags.visibility !== 'public' &&
+          flags.visibility !== 'private'
+        ) {
+          throw new Error('--visibility must be "public" or "private".');
+        }
+        const registryUrl = await resolveRegistryUrl(flags.registry);
+        const result = await publishSkillToRegistry({
+          registryUrl,
+          sourcePath,
+          name: flags.name,
+          version: flags.version,
+          visibility: flags.visibility as 'public' | 'private' | undefined,
+          tags: flags.tag.length > 0 ? flags.tag : undefined,
+          target: parseAgent(flags.target),
+          description: flags.description,
+        });
+        if (flags.json) {
+          printSuccessJson('registry-publish', { ...result });
+          return;
+        }
+        console.log(
+          `${symbols.success} Published ${style.bold(`${result.name}@${result.version}`)} to ${result.registry} (${result.visibility}).`,
+        );
+        console.log(
+          `  ${symbols.arrow} Install anywhere: ${style.cyan(`agentpm source add registry:${result.registry}/index.json && agentpm install ${result.name}`)}`,
+        );
+      },
+    ),
+  [
+    'agentpm registry publish ./my-skill',
+    'agentpm registry publish ./my-skill --registry http://localhost:7420 --visibility private',
+  ],
+);
+
+const registryUserCmd = registryCmd
+  .command('user')
+  .description('Manage registry users (admin only)');
+
+addExamples(
+  registryUserCmd
+    .command('add')
+    .description('Create a registry user')
+    .argument('<username>', 'New username')
+    .option('--registry <url>', 'Registry base URL')
+    .option('--role <role>', 'admin, publisher, or reader', 'publisher')
+    .option('--password <password>', 'Password (default: generated and shown once)')
+    .option('--json', 'Print machine-readable JSON')
+    .action(
+      async (
+        username: string,
+        flags: {
+          registry?: string;
+          role: string;
+          password?: string;
+          json?: boolean;
+        },
+      ) => {
+        const registryUrl = await resolveRegistryUrl(flags.registry);
+        const token = await getRegistryToken(registryUrl);
+        const response = await registryApiRequest({
+          method: 'POST',
+          url: `${registryUrl}/v1/users`,
+          token,
+          body: {
+            username,
+            role: flags.role,
+            ...(flags.password ? { password: flags.password } : {}),
+          },
+        });
+        if (flags.json) {
+          printSuccessJson('registry-user-add', { ...response });
+          return;
+        }
+        console.log(
+          `${symbols.success} Created user ${style.bold(String(response.username))} (${String(response.role)}).`,
+        );
+        if (typeof response.password === 'string') {
+          console.log(
+            `  ${symbols.bullet} One-time password (share securely): ${response.password}`,
+          );
+        }
+      },
+    ),
+  ['agentpm registry user add teammate --role publisher'],
+);
+
+addExamples(
+  registryUserCmd
+    .command('list')
+    .description('List registry users')
+    .option('--registry <url>', 'Registry base URL')
+    .option('--json', 'Print machine-readable JSON')
+    .action(async (flags: { registry?: string; json?: boolean }) => {
+      const registryUrl = await resolveRegistryUrl(flags.registry);
+      const token = await getRegistryToken(registryUrl);
+      const response = await registryApiRequest({
+        method: 'GET',
+        url: `${registryUrl}/v1/users`,
+        token,
+      });
+      const users = Array.isArray(response.users) ? response.users : [];
+      if (flags.json) {
+        printSuccessJson('registry-user-list', { users });
+        return;
+      }
+      section('Registry Users');
+      for (const user of users as Array<Record<string, unknown>>) {
+        console.log(
+          `  ${String(user.username)}  ${String(user.role)}${user.active === false ? '  (inactive)' : ''}`,
+        );
+      }
+      console.log('');
+    }),
+  ['agentpm registry user list'],
+);
+
+const AGENT_GUIDE = `# AgentPM — guide for AI agents
+
+AgentPM manages skills, agents, and Claude Code plugins across native layouts
+(.codex/skills, .claude/skills, .agents/skills, .agentpm/plugins). Every command
+supports --json for machine-readable output and --yes to skip prompts.
+
+## Discover & install skills
+- agentpm skills search <query> --json          # public skills (skills.sh)
+- agentpm skills install <owner/repo@skill> --project --yes --json
+- agentpm source add <owner/repo | registry:URL | ./path> --json
+- agentpm source skills <source> --json         # list installable entries
+- agentpm install <name> --target claude --project --yes --json
+- agentpm list --json                           # installed state
+- agentpm update --apply --yes --json           # update installs
+- agentpm remove <name> --yes --json
+
+## Claude Code plugins
+Repos with .claude-plugin/plugin.json or marketplace.json are indexed as
+plugins. Installing one places it in <scope>/.agentpm/plugins/<name> and keeps
+that folder valid as a Claude Code marketplace. Enable it with:
+- claude plugin marketplace add <scope>/.agentpm/plugins   (once)
+- claude plugin install <name>@agentpm
+
+## Team contract
+- agentpm init --json     # write agentpm.yaml describing required skills
+- agentpm sync --json     # reproduce installs from agentpm.yaml after clone
+
+## Self-hosted registry (share skills with full control)
+- agentpm registry serve                        # start server + web UI
+- agentpm registry login <url> --token <tok>    # or --username/--password
+- agentpm registry publish ./my-skill --json    # push a skill/plugin (version bump is automatic)
+- agentpm source add registry:<url>/index.json  # subscribe to the registry
+- agentpm install <name> --yes --json           # install from it
+Private HTTP registries authenticate via stored login, AGENTPM_REGISTRY_TOKEN,
+or AGENTPM_REGISTRY_TOKEN_<HOST>.
+
+## Diagnostics
+- agentpm doctor --json  # health checks; --fix plans safe repairs
+- agentpm cache clean --dry-run --json
+`;
+
+addExamples(
+  program
+    .command('guide')
+    .description('Print a compact AgentPM guide for AI agents and new users')
+    .option('--json', 'Print machine-readable JSON')
+    .action((flags: { json?: boolean }) => {
+      if (flags.json) {
+        printSuccessJson('guide', { guide: AGENT_GUIDE });
+        return;
+      }
+      console.log(AGENT_GUIDE);
+    }),
+  ['agentpm guide', 'agentpm guide --json'],
 );
 
 try {

@@ -1,0 +1,376 @@
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+
+import { afterAll, describe, expect, test } from 'vitest';
+
+import {
+  AgentPmService,
+  publishSkillToRegistry,
+  registryLogin,
+  registryWhoami,
+} from '@agentpm/core';
+import {
+  fetchSkillArchive,
+  loadRegistryIndex,
+  registryApiRequest,
+} from '@agentpm/registry';
+import {
+  startRegistryServer,
+  type RegistryServerHandle,
+} from '@agentpm/registry-server';
+
+import { copyDir, initFixtureGitRepo, makeTempDir, writeFile } from './helpers';
+
+const CI_TEST_TIMEOUT = process.env.CI ? 60_000 : 30_000;
+
+const handles: RegistryServerHandle[] = [];
+
+async function startServer(): Promise<RegistryServerHandle> {
+  const dataDir = await makeTempDir('agentpm-registry-data-');
+  const handle = await startRegistryServer({ dataDir, port: 0 });
+  handles.push(handle);
+  return handle;
+}
+
+afterAll(async () => {
+  await Promise.allSettled(handles.map((handle) => handle.close()));
+});
+
+async function makeSkillFixture(name: string, body: string): Promise<string> {
+  const dir = await makeTempDir('agentpm-skill-src-');
+  const skillDir = path.join(dir, name);
+  await writeFile(
+    path.join(skillDir, 'SKILL.md'),
+    `---\ndescription: Test skill ${name}\n---\n\n# ${name}\n\n${body}\n`,
+  );
+  await writeFile(path.join(skillDir, 'notes.txt'), body);
+  return skillDir;
+}
+
+describe('registry server', () => {
+  test(
+    'bootstrap, publish, index, archive download, and version bumps',
+    async () => {
+      const server = await startServer();
+      expect(server.bootstrap).not.toBeNull();
+      const token = server.bootstrap!.token;
+      const homeDir = await makeTempDir('agentpm-home-');
+      const env = { AGENTPM_HOME: homeDir, AGENTPM_REGISTRY_TOKEN: token };
+
+      const skillDir = await makeSkillFixture('it-skill', 'version one');
+      const published = await publishSkillToRegistry({
+        registryUrl: server.url,
+        sourcePath: skillDir,
+        env,
+      });
+      expect(published.version).toBe('0.1.0');
+
+      const index = await loadRegistryIndex(`${server.url}/index.json`, env);
+      const entry = index.entries.find((item) => item.name === 'it-skill');
+      expect(entry).toBeDefined();
+      expect(entry!.archive).toContain('v1/skills/it-skill');
+      expect(entry!.version).toBe('0.1.0');
+      expect(entry!.description).toContain('Test skill');
+
+      const archiveUrl = new URL(entry!.archive!, `${server.url}/index.json`).href;
+      const { archive } = await fetchSkillArchive(archiveUrl, env);
+      expect(archive.files.some((file) => file.path === 'SKILL.md')).toBe(true);
+
+      // Publishing again without --version bumps the patch level.
+      const second = await publishSkillToRegistry({
+        registryUrl: server.url,
+        sourcePath: skillDir,
+        env,
+      });
+      expect(second.version).toBe('0.1.1');
+
+      // Re-publishing an existing version is rejected.
+      await expect(
+        publishSkillToRegistry({
+          registryUrl: server.url,
+          sourcePath: skillDir,
+          version: '0.1.1',
+          env,
+        }),
+      ).rejects.toThrow(/already exists/);
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'visibility, login, and user management',
+    async () => {
+      const server = await startServer();
+      const adminToken = server.bootstrap!.token;
+      const homeDir = await makeTempDir('agentpm-home-');
+      const adminEnv = {
+        AGENTPM_HOME: homeDir,
+        AGENTPM_REGISTRY_TOKEN: adminToken,
+      };
+
+      const skillDir = await makeSkillFixture('secret-skill', 'private data');
+      await publishSkillToRegistry({
+        registryUrl: server.url,
+        sourcePath: skillDir,
+        visibility: 'private',
+        env: adminEnv,
+      });
+
+      // Anonymous index excludes private skills.
+      const anonHome = await makeTempDir('agentpm-anon-home-');
+      const anonIndex = await loadRegistryIndex(`${server.url}/index.json`, {
+        AGENTPM_HOME: anonHome,
+      });
+      expect(anonIndex.entries).toHaveLength(0);
+
+      // Authenticated index includes them.
+      const authedIndex = await loadRegistryIndex(
+        `${server.url}/index.json`,
+        adminEnv,
+      );
+      expect(authedIndex.entries.map((item) => item.name)).toContain(
+        'secret-skill',
+      );
+
+      // Admin creates a user; login with the generated password works.
+      const created = await registryApiRequest({
+        method: 'POST',
+        url: `${server.url}/v1/users`,
+        token: adminToken,
+        body: { username: 'teammate', role: 'publisher' },
+      });
+      expect(typeof created.password).toBe('string');
+
+      const loginHome = await makeTempDir('agentpm-login-home-');
+      const login = await registryLogin({
+        url: server.url,
+        username: 'teammate',
+        password: created.password as string,
+        env: { AGENTPM_HOME: loginHome },
+      });
+      expect(login.username).toBe('teammate');
+      expect(login.role).toBe('publisher');
+
+      const whoami = await registryWhoami(server.url, {
+        AGENTPM_HOME: loginHome,
+      });
+      expect(whoami.username).toBe('teammate');
+
+      // Readers cannot publish.
+      await registryApiRequest({
+        method: 'PATCH',
+        url: `${server.url}/v1/users/teammate`,
+        token: adminToken,
+        body: { role: 'reader' },
+      });
+      const readerSkill = await makeSkillFixture('reader-skill', 'nope');
+      await expect(
+        publishSkillToRegistry({
+          registryUrl: server.url,
+          sourcePath: readerSkill,
+          env: { AGENTPM_HOME: loginHome },
+        }),
+      ).rejects.toThrow(/roles/);
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'service roundtrip: add source, install, update, remove',
+    async () => {
+      const server = await startServer();
+      const token = server.bootstrap!.token;
+      const publisherHome = await makeTempDir('agentpm-pub-home-');
+      const publisherEnv = {
+        AGENTPM_HOME: publisherHome,
+        AGENTPM_REGISTRY_TOKEN: token,
+      };
+
+      const skillDir = await makeSkillFixture('rt-skill', 'roundtrip v1');
+      await publishSkillToRegistry({
+        registryUrl: server.url,
+        sourcePath: skillDir,
+        env: publisherEnv,
+      });
+
+      const homeDir = await makeTempDir('agentpm-home-');
+      const projectDir = await makeTempDir('agentpm-project-');
+      const service = new AgentPmService({
+        cwd: projectDir,
+        env: { AGENTPM_HOME: homeDir, AGENTPM_REGISTRY_TOKEN: token },
+      });
+      try {
+        const added = await service.addSource(
+          `registry:${server.url}/index.json`,
+        );
+        expect(added.indexedEntries).toBe(1);
+
+        const installs = await service.install(['rt-skill'], {
+          scope: 'project',
+          yes: true,
+          updateProjectConfig: false,
+        });
+        expect(installs).toHaveLength(1);
+        const install = installs[0]!;
+        expect(install.metadata.archive).toBe(true);
+        expect(install.metadata.archiveVersion).toBe('0.1.0');
+
+        const installedSkillMd = path.join(install.targetPath, 'SKILL.md');
+        await expect(fs.readFile(installedSkillMd, 'utf8')).resolves.toContain(
+          'roundtrip v1',
+        );
+
+        // No changes yet: update preview reports unchanged.
+        const unchanged = await service.previewUpdates({
+          names: ['rt-skill'],
+        });
+        expect(unchanged[0]?.changed).toBe(false);
+
+        // Publish v2, refresh the index, and apply the update.
+        await writeFile(path.join(skillDir, 'SKILL.md'), '# rt-skill\n\nroundtrip v2\n');
+        await publishSkillToRegistry({
+          registryUrl: server.url,
+          sourcePath: skillDir,
+          env: publisherEnv,
+        });
+        await service.refreshSources();
+
+        const previews = await service.update({ apply: true, yes: true });
+        const preview = previews.find(
+          (item) => item.install.name === 'rt-skill',
+        );
+        expect(preview?.changed).toBe(true);
+        await expect(fs.readFile(installedSkillMd, 'utf8')).resolves.toContain(
+          'roundtrip v2',
+        );
+
+        const removed = await service.removeInstall('rt-skill');
+        expect(removed.name).toBe('rt-skill');
+        await expect(fs.access(install.targetPath)).rejects.toThrow();
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+});
+
+describe('claude code plugins', () => {
+  test(
+    'install places the plugin in .agentpm/plugins and maintains the marketplace manifest',
+    async () => {
+      const homeDir = await makeTempDir('agentpm-home-');
+      const projectDir = await makeTempDir('agentpm-plugin-project-');
+      const repoDir = await makeTempDir('agentpm-plugin-repo-');
+      await copyDir(path.resolve('tests/fixtures/repos/plugin'), repoDir);
+      initFixtureGitRepo(repoDir);
+
+      const service = new AgentPmService({
+        cwd: projectDir,
+        env: { AGENTPM_HOME: homeDir },
+      });
+      try {
+        const added = await service.addSource(repoDir);
+        expect(added.indexedEntries).toBeGreaterThanOrEqual(2);
+
+        const installs = await service.install(['demo-plugin'], {
+          scope: 'project',
+          yes: true,
+          updateProjectConfig: false,
+        });
+        expect(installs).toHaveLength(1);
+        const install = installs[0]!;
+        expect(install.targetPath).toBe(
+          path.join(projectDir, '.agentpm', 'plugins', 'demo-plugin'),
+        );
+
+        const manifestRaw = await fs.readFile(
+          path.join(install.targetPath, '.claude-plugin', 'plugin.json'),
+          'utf8',
+        );
+        expect(JSON.parse(manifestRaw)).toMatchObject({ name: 'demo-plugin' });
+
+        const marketplacePath = path.join(
+          projectDir,
+          '.agentpm',
+          'plugins',
+          '.claude-plugin',
+          'marketplace.json',
+        );
+        const marketplace = JSON.parse(
+          await fs.readFile(marketplacePath, 'utf8'),
+        ) as {
+          name: string;
+          plugins: Array<{ name: string; source: string }>;
+        };
+        expect(marketplace.plugins).toEqual([
+          expect.objectContaining({
+            name: 'demo-plugin',
+            source: './demo-plugin',
+          }),
+        ]);
+
+        await service.removeInstall('demo-plugin');
+        await expect(fs.access(marketplacePath)).rejects.toThrow();
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'publish and reinstall a plugin through the registry keeps plugin detection',
+    async () => {
+      const server = await startServer();
+      const token = server.bootstrap!.token;
+      const publisherHome = await makeTempDir('agentpm-pub-home-');
+
+      const pluginSource = await makeTempDir('agentpm-plugin-src-');
+      await copyDir(
+        path.resolve('tests/fixtures/repos/plugin'),
+        pluginSource,
+      );
+
+      const published = await publishSkillToRegistry({
+        registryUrl: server.url,
+        sourcePath: pluginSource,
+        name: 'demo-plugin',
+        env: { AGENTPM_HOME: publisherHome, AGENTPM_REGISTRY_TOKEN: token },
+      });
+      expect(published.name).toBe('demo-plugin');
+
+      const homeDir = await makeTempDir('agentpm-home-');
+      const projectDir = await makeTempDir('agentpm-plugin-project-');
+      const service = new AgentPmService({
+        cwd: projectDir,
+        env: { AGENTPM_HOME: homeDir, AGENTPM_REGISTRY_TOKEN: token },
+      });
+      try {
+        await service.addSource(`registry:${server.url}/index.json`);
+        const installs = await service.install(['demo-plugin'], {
+          scope: 'project',
+          yes: true,
+          updateProjectConfig: false,
+        });
+        expect(installs).toHaveLength(1);
+        expect(installs[0]!.targetPath).toBe(
+          path.join(projectDir, '.agentpm', 'plugins', 'demo-plugin'),
+        );
+        await expect(
+          fs.readFile(
+            path.join(
+              installs[0]!.targetPath,
+              '.claude-plugin',
+              'plugin.json',
+            ),
+            'utf8',
+          ),
+        ).resolves.toContain('demo-plugin');
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+});
