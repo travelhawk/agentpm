@@ -7,10 +7,10 @@ import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
-  AGENTPM_PLUGIN_ROOT,
   getAdapter,
   inspectRepository,
   listInstallableEntries,
+  nativePluginRoot,
   nativeSkillRoot,
 } from '@agentpm/adapters';
 import {
@@ -825,12 +825,16 @@ export class AgentPmService {
               )
             : null);
 
+        // The adapter is part of the identity so the same skill/plugin name can
+        // be installed for two agents (e.g. codex and claude) from one source
+        // without the second install overwriting the first record.
         const installId = makeId(
           'inst',
           selection.source.id,
           mapping.name,
           scope,
           scopeRoot,
+          mapping.adapter,
         );
         const savedInstall = this.db.saveInstall({
           id: installId,
@@ -870,13 +874,21 @@ export class AgentPmService {
         installs.push(savedInstall);
 
         if (detectedEntry.kind === 'plugin') {
-          const marketplaceName =
-            await this.syncPluginMarketplace(scopeRoot);
+          const marketplaceName = await this.syncPluginMarketplace(
+            scopeRoot,
+            mapping.adapter,
+          );
+          const pluginRoot = path.join(
+            scopeRoot,
+            nativePluginRoot(mapping.adapter),
+          );
+          const cli = mapping.adapter === 'codex' ? 'codex' : 'claude';
+          const installVerb =
+            mapping.adapter === 'codex' ? 'add' : 'install';
           this.reportStatus(
-            `Plugin ready. Enable it in Claude Code:\n` +
-              `  claude plugin marketplace add ${path.join(scopeRoot, AGENTPM_PLUGIN_ROOT)}\n` +
-              `  claude plugin install ${mapping.name}@${marketplaceName}\n` +
-              `  (one-off alternative: claude --plugin-dir ${targetPath})`,
+            `Plugin ready. Enable it in ${cli === 'codex' ? 'Codex' : 'Claude Code'}:\n` +
+              `  ${cli} plugin marketplace add ${pluginRoot}\n` +
+              `  ${cli} plugin ${installVerb} ${mapping.name}@${marketplaceName}`,
           );
         }
       } finally {
@@ -975,7 +987,7 @@ export class AgentPmService {
     previews: UpdatePreview[],
     options: UpdateOptions,
   ): Promise<UpdatePreview[]> {
-    const pluginScopeRoots = new Set<string>();
+    const pluginMarketplaces = new Map<string, { scopeRoot: string; adapter: AdapterId }>();
     for (const preview of previews) {
       if (!preview.changed || !preview.nextLinkTarget) {
         continue;
@@ -1028,16 +1040,14 @@ export class AgentPmService {
           updatedAt: nowIso(),
         });
 
-        const pluginRoot = path.join(
-          preview.install.scopeRoot,
-          AGENTPM_PLUGIN_ROOT,
-        );
-        if (
-          path
-            .resolve(preview.install.targetPath)
-            .startsWith(path.resolve(pluginRoot) + path.sep)
-        ) {
-          pluginScopeRoots.add(preview.install.scopeRoot);
+        if (this.isPluginInstall(preview.install)) {
+          pluginMarketplaces.set(
+            `${preview.install.scopeRoot}::${preview.install.adapter}`,
+            {
+              scopeRoot: preview.install.scopeRoot,
+              adapter: preview.install.adapter,
+            },
+          );
         }
       } catch (error) {
         throw new AgentPmError(
@@ -1048,8 +1058,8 @@ export class AgentPmService {
 
     // Refresh each affected plugin marketplace once so its manifest reflects
     // the updated plugin versions/descriptions.
-    for (const scopeRoot of pluginScopeRoots) {
-      await this.syncPluginMarketplace(scopeRoot);
+    for (const { scopeRoot, adapter } of pluginMarketplaces.values()) {
+      await this.syncPluginMarketplace(scopeRoot, adapter);
     }
 
     return previews;
@@ -4287,35 +4297,52 @@ export class AgentPmService {
       });
     }
 
-    const pluginRoot = path.join(install.scopeRoot, AGENTPM_PLUGIN_ROOT);
-    if (
-      path
-        .resolve(install.targetPath)
-        .startsWith(path.resolve(pluginRoot) + path.sep)
-    ) {
-      await this.syncPluginMarketplace(install.scopeRoot);
+    // If this was a plugin install, refresh its agent's managed marketplace.
+    if (this.isPluginInstall(install)) {
+      await this.syncPluginMarketplace(install.scopeRoot, install.adapter);
     }
 
     return install;
   }
 
-  // Keeps <scopeRoot>/.agentpm/plugins/.claude-plugin/marketplace.json in sync
-  // with the plugin directories AgentPM manages there, so Claude Code can use
-  // the folder as a marketplace. Returns the marketplace name.
-  private async syncPluginMarketplace(scopeRoot: string): Promise<string> {
-    const pluginsRoot = path.join(scopeRoot, AGENTPM_PLUGIN_ROOT);
+  private isPluginInstall(install: InstallRecord): boolean {
+    const pluginRoot = path.resolve(
+      install.scopeRoot,
+      nativePluginRoot(install.adapter),
+    );
+    return path
+      .resolve(install.targetPath)
+      .startsWith(pluginRoot + path.sep);
+  }
+
+  // Keeps a managed plugin marketplace in sync with the plugin directories
+  // AgentPM installs under <scopeRoot>/.agentpm/plugins/<adapter>/plugins/*, in
+  // the native format each host discovers:
+  //   claude -> <root>/.claude-plugin/marketplace.json
+  //   codex  -> <root>/.agents/plugins/marketplace.json
+  // Returns the marketplace name.
+  private async syncPluginMarketplace(
+    scopeRoot: string,
+    adapter: AdapterId,
+  ): Promise<string> {
+    const root = path.join(scopeRoot, nativePluginRoot(adapter));
+    const pluginsRoot = path.join(root, 'plugins');
     const marketplaceName =
       path.resolve(scopeRoot) === path.resolve(os.homedir())
         ? 'agentpm'
         : `agentpm-${slugify(path.basename(scopeRoot))}`;
+    const manifestRelDir =
+      adapter === 'codex' ? path.join('.agents', 'plugins') : '.claude-plugin';
+    const manifestPath = path.join(root, manifestRelDir, 'marketplace.json');
 
-    const plugins: Array<Record<string, unknown>> = [];
+    const discovered: Array<{
+      name: string;
+      description?: string | undefined;
+      version?: string | undefined;
+    }> = [];
     if (await pathExists(pluginsRoot)) {
       const children = await fs.readdir(pluginsRoot, { withFileTypes: true });
       for (const child of children.sort((a, b) => a.name.localeCompare(b.name))) {
-        if (child.name === '.claude-plugin') {
-          continue;
-        }
         const childPath = path.join(pluginsRoot, child.name);
         try {
           const stats = await fs.stat(childPath);
@@ -4325,12 +4352,14 @@ export class AgentPmService {
         } catch {
           continue;
         }
+        const manifestDir =
+          adapter === 'codex' ? '.codex-plugin' : '.claude-plugin';
         let description: string | undefined;
         let version: string | undefined;
         try {
           const manifest = JSON.parse(
             await fs.readFile(
-              path.join(childPath, '.claude-plugin', 'plugin.json'),
+              path.join(childPath, manifestDir, 'plugin.json'),
               'utf8',
             ),
           ) as Record<string, unknown>;
@@ -4343,40 +4372,49 @@ export class AgentPmService {
         } catch {
           // Plugins without their own manifest are still listed by path.
         }
-        plugins.push({
-          name: child.name,
-          source: `./${child.name}`,
-          ...(description ? { description } : {}),
-          ...(version ? { version } : {}),
-        });
+        discovered.push({ name: child.name, description, version });
       }
     }
 
-    if (plugins.length === 0) {
-      await fs.rm(path.join(pluginsRoot, '.claude-plugin'), {
+    if (discovered.length === 0) {
+      await fs.rm(path.join(root, manifestRelDir), {
         recursive: true,
         force: true,
       });
       return marketplaceName;
     }
 
-    const manifestPath = path.join(
-      pluginsRoot,
-      '.claude-plugin',
-      'marketplace.json',
-    );
+    const manifest =
+      adapter === 'codex'
+        ? {
+            name: marketplaceName,
+            interface: { displayName: 'AgentPM' },
+            plugins: discovered.map((plugin) => ({
+              name: plugin.name,
+              source: { source: 'local', path: `./plugins/${plugin.name}` },
+              policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+              ...(plugin.description
+                ? { description: plugin.description }
+                : {}),
+            })),
+          }
+        : {
+            name: marketplaceName,
+            owner: { name: 'AgentPM' },
+            plugins: discovered.map((plugin) => ({
+              name: plugin.name,
+              source: `./plugins/${plugin.name}`,
+              ...(plugin.description
+                ? { description: plugin.description }
+                : {}),
+              ...(plugin.version ? { version: plugin.version } : {}),
+            })),
+          };
+
     await ensureDir(path.dirname(manifestPath));
     await fs.writeFile(
       manifestPath,
-      `${JSON.stringify(
-        {
-          name: marketplaceName,
-          owner: { name: 'AgentPM' },
-          plugins,
-        },
-        null,
-        2,
-      )}\n`,
+      `${JSON.stringify(manifest, null, 2)}\n`,
       'utf8',
     );
     return marketplaceName;

@@ -330,7 +330,7 @@ describe('registry server', () => {
 
 describe('claude code plugins', () => {
   test(
-    'install places the plugin in .agentpm/plugins and maintains the marketplace manifest',
+    'installs a Claude plugin and maintains the Claude marketplace manifest',
     async () => {
       const homeDir = await makeTempDir('agentpm-home-');
       const projectDir = await makeTempDir('agentpm-plugin-project-');
@@ -348,13 +348,22 @@ describe('claude code plugins', () => {
 
         const installs = await service.install(['demo-plugin'], {
           scope: 'project',
+          target: 'claude',
           yes: true,
           updateProjectConfig: false,
         });
         expect(installs).toHaveLength(1);
         const install = installs[0]!;
+        expect(install.adapter).toBe('claude');
         expect(install.targetPath).toBe(
-          path.join(projectDir, '.agentpm', 'plugins', 'demo-plugin'),
+          path.join(
+            projectDir,
+            '.agentpm',
+            'plugins',
+            'claude',
+            'plugins',
+            'demo-plugin',
+          ),
         );
 
         const manifestRaw = await fs.readFile(
@@ -367,6 +376,7 @@ describe('claude code plugins', () => {
           projectDir,
           '.agentpm',
           'plugins',
+          'claude',
           '.claude-plugin',
           'marketplace.json',
         );
@@ -379,7 +389,7 @@ describe('claude code plugins', () => {
         expect(marketplace.plugins).toEqual([
           expect.objectContaining({
             name: 'demo-plugin',
-            source: './demo-plugin',
+            source: './plugins/demo-plugin',
           }),
         ]);
 
@@ -433,6 +443,79 @@ describe('claude code plugins', () => {
   );
 
   test(
+    'installs a Codex plugin into the codex marketplace with the native manifest',
+    async () => {
+      const homeDir = await makeTempDir('agentpm-home-');
+      const projectDir = await makeTempDir('agentpm-codex-plugin-project-');
+      const repoDir = await makeTempDir('agentpm-codex-plugin-repo-');
+      await copyDir(path.resolve('tests/fixtures/repos/codex-plugin'), repoDir);
+      initFixtureGitRepo(repoDir);
+
+      const service = new AgentPmService({
+        cwd: projectDir,
+        env: { AGENTPM_HOME: homeDir },
+      });
+      try {
+        await service.addSource(repoDir);
+        const installs = await service.install(['demo-codex'], {
+          scope: 'project',
+          target: 'codex',
+          yes: true,
+          updateProjectConfig: false,
+        });
+        expect(installs).toHaveLength(1);
+        const install = installs[0]!;
+        expect(install.adapter).toBe('codex');
+        expect(install.targetPath).toBe(
+          path.join(
+            projectDir,
+            '.agentpm',
+            'plugins',
+            'codex',
+            'plugins',
+            'demo-codex',
+          ),
+        );
+        await expect(
+          fs.readFile(
+            path.join(install.targetPath, '.codex-plugin', 'plugin.json'),
+            'utf8',
+          ),
+        ).resolves.toContain('demo-codex');
+
+        // Codex reads .agents/plugins/marketplace.json with an object source.
+        const marketplacePath = path.join(
+          projectDir,
+          '.agentpm',
+          'plugins',
+          'codex',
+          '.agents',
+          'plugins',
+          'marketplace.json',
+        );
+        const marketplace = JSON.parse(
+          await fs.readFile(marketplacePath, 'utf8'),
+        ) as {
+          name: string;
+          plugins: Array<{ name: string; source: { source: string; path: string } }>;
+        };
+        expect(marketplace.plugins).toEqual([
+          expect.objectContaining({
+            name: 'demo-codex',
+            source: { source: 'local', path: './plugins/demo-codex' },
+          }),
+        ]);
+
+        await service.removeInstall('demo-codex');
+        await expect(fs.access(marketplacePath)).rejects.toThrow();
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
     'publish and reinstall a plugin through the registry keeps plugin detection',
     async () => {
       const server = await startServer();
@@ -468,7 +551,14 @@ describe('claude code plugins', () => {
         });
         expect(installs).toHaveLength(1);
         expect(installs[0]!.targetPath).toBe(
-          path.join(projectDir, '.agentpm', 'plugins', 'demo-plugin'),
+          path.join(
+            projectDir,
+            '.agentpm',
+            'plugins',
+            'claude',
+            'plugins',
+            'demo-plugin',
+          ),
         );
         await expect(
           fs.readFile(

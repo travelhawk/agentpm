@@ -144,11 +144,16 @@ async function inferSkillMetadata(sourcePath: string): Promise<{
   kind: EntryKind;
   description: string | undefined;
 }> {
-  if (await pathExists(path.join(sourcePath, '.claude-plugin', 'plugin.json'))) {
+  for (const manifestDir of ['.claude-plugin', '.codex-plugin']) {
+    const manifestPath = path.join(sourcePath, manifestDir, 'plugin.json');
+    if (!(await pathExists(manifestPath))) {
+      continue;
+    }
     try {
-      const manifest = JSON.parse(
-        await readTextFile(path.join(sourcePath, '.claude-plugin', 'plugin.json')),
-      ) as Record<string, unknown>;
+      const manifest = JSON.parse(await readTextFile(manifestPath)) as Record<
+        string,
+        unknown
+      >;
       return {
         kind: 'plugin',
         description:
@@ -213,12 +218,12 @@ export async function publishSkillToRegistry(
   // Guard against publishing an unrelated folder by mistake: require a skill or
   // plugin marker unless the caller explicitly forces the kind.
   const hasSkillMarker = await pathExists(path.join(sourcePath, 'SKILL.md'));
-  const hasPluginMarker = await pathExists(
-    path.join(sourcePath, '.claude-plugin', 'plugin.json'),
-  );
+  const hasPluginMarker =
+    (await pathExists(path.join(sourcePath, '.claude-plugin', 'plugin.json'))) ||
+    (await pathExists(path.join(sourcePath, '.codex-plugin', 'plugin.json')));
   if (!hasSkillMarker && !hasPluginMarker && !options.kind) {
     throw new AgentPmError(
-      `${sourcePath} has no SKILL.md or .claude-plugin/plugin.json. Point at a skill or plugin folder, or pass an explicit --kind to publish it anyway.`,
+      `${sourcePath} has no SKILL.md or plugin manifest (.claude-plugin/ or .codex-plugin/). Point at a skill or plugin folder, or pass an explicit --kind to publish it anyway.`,
     );
   }
 

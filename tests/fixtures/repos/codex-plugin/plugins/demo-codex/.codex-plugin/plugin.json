@@ -1,0 +1,7 @@
+{
+  "name": "demo-codex",
+  "version": "1.0.0",
+  "description": "Demo Codex plugin used by AgentPM tests",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

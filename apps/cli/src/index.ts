@@ -2384,14 +2384,15 @@ support --json for machine-readable output, and commands that prompt accept
 - agentpm update --yes --json                   # preview and apply updates
 - agentpm remove <name> --json
 
-## Claude Code plugins
-Repos with .claude-plugin/plugin.json or marketplace.json are indexed as
-plugins. Installing one places it in <scope>/.agentpm/plugins/<name> and keeps
-that folder valid as a Claude Code marketplace. Enable it with:
-- claude plugin marketplace add <scope>/.agentpm/plugins   (once)
-- claude plugin install <name>@agentpm            # global scope
-- claude plugin install <name>@agentpm-<folder>   # project scope
-The exact enable command is printed after install.
+## Plugins (Claude Code and Codex)
+Repos with .claude-plugin/plugin.json (Claude Code) or .codex-plugin/plugin.json
+(Codex), or a matching marketplace.json, are indexed as plugins. Install with
+--target claude or --target codex; the plugin lands in
+<scope>/.agentpm/plugins/<agent>/plugins/<name>, and AgentPM keeps that folder
+valid as that agent's native marketplace. Enable it with (exact command printed
+after install):
+- claude plugin marketplace add <scope>/.agentpm/plugins/claude && claude plugin install <name>@agentpm[-<folder>]
+- codex plugin marketplace add <scope>/.agentpm/plugins/codex && codex plugin add <name>@agentpm[-<folder>]
 
 ## Team contract
 - agentpm init --json     # write agentpm.yaml describing required skills

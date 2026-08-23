@@ -72,7 +72,8 @@ agentpm install my-skill
   `~/.agentpm/credentials.json`; environment tokens keep working and take
   precedence.
 - Publishing accepts any folder with a `SKILL.md` (skills) or a
-  `.claude-plugin/plugin.json` (Claude Code plugins). Re-publishing an
+  `.claude-plugin/plugin.json` / `.codex-plugin/plugin.json` (Claude Code or
+  Codex plugins); pass `--kind` to publish anything else. Re-publishing an
   existing version is rejected; omit `--version` to bump the latest patch
   automatically.
 

@@ -1,55 +1,78 @@
-# Claude Code Plugin Guide
+# Plugin Guide (Claude Code and Codex)
 
-AgentPM indexes and installs Claude Code plugins alongside skills and agents.
+AgentPM indexes and installs **Claude Code** and **Codex** plugins alongside
+skills and agents.
 
 ## Detection
 
-A source repository exposes plugins when it contains:
+A source repository exposes plugins when it contains a per-agent manifest or
+marketplace:
 
-- `.claude-plugin/plugin.json` — a single plugin whose root is the parent of
-  the `.claude-plugin` directory. The manifest `name` wins over the folder
-  name.
-- `.claude-plugin/marketplace.json` — a marketplace manifest. Plugins listed
-  with relative-path sources (`"source": "./plugins/foo"`) are indexed as
-  installable entries too.
+| Agent | Plugin manifest | Marketplace manifest |
+|-------|-----------------|----------------------|
+| Claude Code | `.claude-plugin/plugin.json` | `.claude-plugin/marketplace.json` |
+| Codex | `.codex-plugin/plugin.json` | `.agents/plugins/marketplace.json` (and `api_marketplace.json`) |
 
-Plugin entries use the `plugin` kind and the `claude` adapter.
+For each plugin directory, the manifest `name` wins over the folder name.
+Marketplace manifests are also read: plugins listed with a local relative-path
+source are indexed too. Claude uses a string source (`"./plugins/foo"`); Codex
+uses an object source (`{ "source": "local", "path": "./plugins/foo" }`).
+
+A repository that carries **both** manifests yields one plugin entry per agent,
+so you can install it for Claude Code and Codex independently. Plugin entries
+use the `plugin` kind; the entry's agent (`claude`/`codex`) is chosen with
+`--target`.
 
 ## Installation model
 
-`agentpm install <plugin-name>` places the plugin at
-`<scope root>/.agentpm/plugins/<name>` (a managed link into the AgentPM cache,
-like every other install). AgentPM also maintains
-`<scope root>/.agentpm/plugins/.claude-plugin/marketplace.json`, which makes
-that folder a valid **local Claude Code marketplace**.
+`agentpm install <plugin> --target claude|codex` places the plugin at
+`<scope>/.agentpm/plugins/<agent>/plugins/<name>` (a managed link into the
+AgentPM cache, like every other install). AgentPM also maintains the agent's
+native marketplace manifest in that root, so the folder is a valid **local
+marketplace** for that agent:
 
-Enable an installed plugin natively in Claude Code:
+- Claude Code → `<scope>/.agentpm/plugins/claude/.claude-plugin/marketplace.json`
+- Codex → `<scope>/.agentpm/plugins/codex/.agents/plugins/marketplace.json`
+
+Enable an installed plugin natively:
 
 ```bash
-# once per scope root:
-claude plugin marketplace add <scope root>/.agentpm/plugins
+# Claude Code
+claude plugin marketplace add <scope>/.agentpm/plugins/claude   # once per scope
+claude plugin install <name>@agentpm            # global scope
+claude plugin install <name>@agentpm-<folder>   # project scope
 
-# then per plugin:
-claude plugin install <name>@agentpm          # global scope
-claude plugin install <name>@agentpm-<repo>   # project scope
-
-# one-off session without registering anything:
-claude --plugin-dir <scope root>/.agentpm/plugins/<name>
+# Codex
+codex plugin marketplace add <scope>/.agentpm/plugins/codex     # once per scope
+codex plugin add <name>@agentpm                 # global scope
+codex plugin add <name>@agentpm-<folder>        # project scope
 ```
 
-AgentPM never writes to `~/.claude/plugins` or Claude Code's own settings —
-Claude Code stays the source of truth for enablement, AgentPM stays the source
-of truth for content, updates, and provenance.
+The exact enable command (with the resolved marketplace name) is printed after
+each plugin install.
+
+AgentPM never writes to `~/.claude/plugins`, `~/.codex/config.toml`, or either
+host's settings — the host stays the source of truth for enablement, AgentPM
+stays the source of truth for content, updates, and provenance.
 
 ## Updating and removing
 
-- `agentpm update --yes` refreshes plugin content like any other install.
-- `agentpm remove <name>` removes the managed link and rewrites the
-  marketplace manifest (the manifest disappears when the last plugin is
-  removed).
+- `agentpm update --yes` refreshes plugin content and rewrites the affected
+  marketplace manifest so its versions/descriptions stay in sync.
+- `agentpm remove <name> --target <agent>` removes the managed link and
+  rewrites the marketplace manifest (the manifest disappears when the last
+  plugin for that agent is removed).
 
 ## Publishing plugins to a registry
 
-`agentpm registry publish ./my-plugin` detects `.claude-plugin/plugin.json`
-and publishes the folder as a `plugin`-kind archive. Installing it from the
-registry restores the same layout and marketplace behavior.
+`agentpm registry publish ./my-plugin` detects `.claude-plugin/plugin.json` or
+`.codex-plugin/plugin.json` and publishes the folder as a `plugin`-kind archive.
+Installing it from the registry restores the same layout and marketplace
+behavior for the detected agent.
+
+## Not managed by AgentPM
+
+AgentPM materializes plugin **content** and the local marketplace manifest. It
+does not run `claude plugin` / `codex plugin` for you, and it does not toggle a
+plugin's enabled state in the host's own config — run the printed enable
+commands for that.

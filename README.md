@@ -151,7 +151,7 @@ agentpm doctor --fix --yes --json
 ## What AgentPM Does Well
 
 - `📦` Install skills from Git repositories, local folders, static registries, and the public `skills.sh` bridge.
-- `🔌` Install Claude Code plugins (`.claude-plugin/plugin.json` and marketplace repos) into a managed local marketplace Claude Code consumes natively.
+- `🔌` Install Claude Code **and** Codex plugins (`.claude-plugin/` / `.codex-plugin/` manifests and marketplace repos) into a managed local marketplace each host consumes natively.
 - `🏠` Run your own registry with `agentpm registry serve`: users, API tokens, public/private skills, publish/install, and a built-in web UI for curation.
 - `🧭` Keep the CLI thin while respecting native agent layouts instead of rewriting them.
 - `🤝` Turn `agentpm.yaml` into a reproducible team contract for repo-scoped skills.
@@ -179,16 +179,22 @@ The web UI at the server root lets you browse and search skills, read their
 docs, copy install commands, toggle public/private visibility, and manage
 users and API tokens. See `docs/registry-guide.md` for the full picture.
 
-## Claude Code Plugins
+## Plugins (Claude Code and Codex)
 
-Repos containing `.claude-plugin/plugin.json` (or a marketplace manifest) are
-indexed as plugins. `agentpm install <plugin>` places the plugin under
-`<scope>/.agentpm/plugins/<name>` and maintains a marketplace manifest there,
-so Claude Code can use it natively:
+Repos containing `.claude-plugin/plugin.json` (Claude Code) or
+`.codex-plugin/plugin.json` (Codex) — or a matching marketplace manifest — are
+indexed as plugins. `agentpm install <plugin> --target claude|codex` places the
+plugin under `<scope>/.agentpm/plugins/<agent>/plugins/<name>` and maintains
+that agent's native marketplace manifest there, so the host can use it natively:
 
 ```bash
-claude plugin marketplace add ~/.agentpm/plugins   # once
+# Claude Code
+claude plugin marketplace add ~/.agentpm/plugins/claude   # once
 claude plugin install <name>@agentpm
+
+# Codex
+codex plugin marketplace add ~/.agentpm/plugins/codex     # once
+codex plugin add <name>@agentpm
 ```
 
 See `docs/plugin-guide.md` for details.
