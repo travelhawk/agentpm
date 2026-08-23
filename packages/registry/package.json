@@ -1,6 +1,6 @@
 {
   "name": "@agentpm/registry",
-  "version": "0.9.2",
+  "version": "0.10.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -11,6 +11,7 @@
     "build": "tsup src/index.ts --format esm --target node24 --clean --dts --tsconfig tsconfig.build.json"
   },
   "dependencies": {
+    "@agentpm/fs": "workspace:*",
     "@agentpm/shared": "workspace:*",
     "js-yaml": "^4.1.0"
   }

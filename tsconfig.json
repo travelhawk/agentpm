@@ -11,6 +11,7 @@
       "@agentpm/fs": ["packages/fs/src/index.ts"],
       "@agentpm/git": ["packages/git/src/index.ts"],
       "@agentpm/registry": ["packages/registry/src/index.ts"],
+      "@agentpm/registry-server": ["packages/registry-server/src/index.ts"],
       "@agentpm/shared": ["packages/shared/src/index.ts"],
       "@agentpm/ui": ["packages/ui/src/index.tsx"]
     }

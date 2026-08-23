@@ -321,6 +321,9 @@ export function projectConfigToManifest(
   if (record.skills !== undefined && !Array.isArray(record.skills)) {
     throw new AgentPmError('skills must be an array.');
   }
+  if (record.targets !== undefined && !Array.isArray(record.targets)) {
+    throw new AgentPmError('targets must be an array.');
+  }
   return {
     version: config.version ?? MANIFEST_VERSION,
     sources: (config.sources ?? []).map((source) =>

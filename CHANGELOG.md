@@ -8,6 +8,28 @@ This repo uses a simple release workflow:
 - each release-facing cycle bumps the workspace package versions together
 - changelog and version bumps should land in the same commit when practical
 
+## [0.10.0] - 2026-08-22
+
+### Added
+
+- **Self-hosted registry server** (`agentpm registry serve`): a dependency-free Node HTTP server with SQLite-backed users, API tokens, and skills. It supports roles (admin/publisher/reader), public/private skill visibility, versioned skill/plugin archives, a compatible `/index.json`, and an embedded web UI for browsing, searching, curation, and user/token management. New CLI: `agentpm registry serve/login/logout/whoami/publish/user`.
+- **Registry publish/subscribe over archives**: registry index entries may reference a JSON skill **archive** (format v1) instead of a Git repo. `agentpm registry publish <folder>` packs a skill or plugin, auto-bumps the patch version, and installs flow through the normal adapter/link/update pipeline. Credentials are stored per registry origin via `agentpm registry login` (env `AGENTPM_REGISTRY_TOKEN[_<HOST>]` still take precedence).
+- **Claude Code and Codex plugin support**: repositories with `.claude-plugin/plugin.json` (Claude Code) or `.codex-plugin/plugin.json` (Codex) — or a matching marketplace manifest — are indexed as a new `plugin` entry kind. Installing one (`--target claude|codex`) lands under `<scope>/.agentpm/plugins/<agent>/plugins/<name>` and maintains that host's native marketplace manifest there (`.claude-plugin/marketplace.json` for Claude, `.agents/plugins/marketplace.json` for Codex), so each host consumes the folder natively. Install ids now include the adapter, so the same name can be installed for two agents.
+- `agentpm guide` prints a compact, agent-oriented reference for discovery, installs, plugins, the team contract, and the self-hosted registry.
+- `agentpm install` gained a `--kind <skill|agent|subagent|plugin>` filter, and when a name resolves to more than one entry (e.g. a skill and a plugin, or the same name for two agents) it now offers an interactive picker or, non-interactively, errors with the `--kind`/`--target` filters that select one — instead of silently picking the first match.
+
+### Fixed
+
+- `agentpm update` now reuses each install's cache key and registers the materialized release, so revision-pinned installs (e.g. from `agentpm sync`) are no longer deleted by a later `agentpm cache clean`.
+- Service status messages are written to stderr, so `--json` output on stdout stays machine-parseable for `source add`, `install`, `skills install`, and `sync`; `update`/`skills update`/`doctor` no longer interleave human output before their JSON, and `doctor --fix --json` returns planned fixes without requiring a TTY.
+- `agentpm doctor` no longer reports registry-archive installs as missing local content; duplicate registry entry names surface a clear error instead of a raw SQLite failure; archive installs from one-off `--from` sources now detect new versions.
+- Registry index archive URLs are root-absolute so `/v1/index.json` resolves correctly, and `--target` is accepted case-insensitively everywhere.
+
+### Security
+
+- Skill archive versions and Claude Code plugin names are validated so a malicious archive or repository cannot write or link outside the intended directory; the publish handler adds a path-containment check.
+- Registry login verifies passwords off the event loop and throttles repeated failures; the CLI strips the bearer token on cross-origin redirects and masks the interactive password prompt.
+
 ## [0.9.2] - 2026-06-30
 
 ### Added

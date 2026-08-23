@@ -1,6 +1,11 @@
 import path from 'node:path';
 
-import { listChildDirectories, pathExists, walkFiles } from '@agentpm/fs';
+import {
+  listChildDirectories,
+  pathExists,
+  readTextFile,
+  walkFiles,
+} from '@agentpm/fs';
 import {
   AgentPmError,
   stableHash,
@@ -104,7 +109,188 @@ const ENTRY_MARKERS: Record<DetectedGroup['kind'], string[]> = {
   skill: ['SKILL.md'],
   subagent: ['SKILL.md'],
   agent: ['README.md', 'AGENT.md', 'CLAUDE.md'],
+  // Plugins are detected by dedicated marker logic (.claude-plugin/plugin.json),
+  // not by the generic layout scan.
+  plugin: [],
 };
+
+// AgentPM keeps installed plugins under a per-agent managed marketplace root so
+// each host reads its own native manifest without clashing:
+//   claude -> <root>/.claude-plugin/marketplace.json   (`claude plugin marketplace add <root>`)
+//   codex  -> <root>/.agents/plugins/marketplace.json   (`codex plugin marketplace add <root>`)
+// Plugins live at <root>/plugins/<name>, mirroring the openai/plugins layout.
+const PLUGIN_ROOTS: Partial<Record<AdapterId, string>> = {
+  claude: '.agentpm/plugins/claude',
+  codex: '.agentpm/plugins/codex',
+};
+
+export const PLUGIN_ADAPTERS: AdapterId[] = ['claude', 'codex'];
+
+export function nativePluginRoot(adapter: AdapterId): string {
+  return PLUGIN_ROOTS[adapter] ?? '.agentpm/plugins/generic';
+}
+
+export function pluginTargetRelativePath(
+  adapter: AdapterId,
+  name: string,
+): string {
+  return toPosixPath(path.join(nativePluginRoot(adapter), 'plugins', name));
+}
+
+// Per-agent plugin manifest markers. A repo is a plugin for an agent when it
+// carries that agent's `<marker>/plugin.json`; marketplaces are listed under
+// the marketplace file names Codex/Claude Code discover.
+interface PluginMarker {
+  adapter: AdapterId;
+  manifestDir: string;
+  marketplaceFiles: string[];
+  label: string;
+}
+
+const PLUGIN_MARKERS: PluginMarker[] = [
+  {
+    adapter: 'claude',
+    manifestDir: '.claude-plugin',
+    marketplaceFiles: ['.claude-plugin/marketplace.json'],
+    label: 'Claude Code plugins',
+  },
+  {
+    adapter: 'codex',
+    manifestDir: '.codex-plugin',
+    marketplaceFiles: [
+      '.agents/plugins/marketplace.json',
+      '.agents/plugins/api_marketplace.json',
+    ],
+    label: 'Codex plugins',
+  },
+];
+
+const SAFE_PLUGIN_NAME = /^[a-z0-9][a-z0-9._-]*$/i;
+
+// A plugin name becomes a directory segment under the managed plugin root, so
+// it must be a single safe path segment. Untrusted repos can put anything in a
+// manifest, so fall back to the directory basename when the name is unsafe.
+function safePluginName(raw: unknown, pluginRoot: string): string {
+  return typeof raw === 'string' && SAFE_PLUGIN_NAME.test(raw.trim())
+    ? raw.trim()
+    : path.basename(pluginRoot);
+}
+
+async function readJsonFile(filePath: string): Promise<Record<string, unknown> | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readTextFile(filePath));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function marketplaceSourcePath(source: unknown): string | null {
+  // Claude Code uses a string source ("./plugins/foo"); Codex uses an object
+  // { source: "local", path: "./plugins/foo" }.
+  if (typeof source === 'string') {
+    return source.startsWith('.') ? source : null;
+  }
+  if (source && typeof source === 'object') {
+    const record = source as Record<string, unknown>;
+    if (record.source === 'local' && typeof record.path === 'string') {
+      return record.path.startsWith('.') ? record.path : null;
+    }
+  }
+  return null;
+}
+
+async function detectPluginGroupsForMarker(
+  rootPath: string,
+  files: string[],
+  marker: PluginMarker,
+): Promise<DetectedGroup[]> {
+  const pluginRoots = new Map<string, string>();
+
+  for (const filePath of files) {
+    const base = path.basename(filePath);
+    const parent = path.basename(path.dirname(filePath));
+    if (base === 'plugin.json' && parent === marker.manifestDir) {
+      const pluginRoot = path.dirname(path.dirname(filePath));
+      const manifest = await readJsonFile(filePath);
+      pluginRoots.set(pluginRoot, safePluginName(manifest?.name, pluginRoot));
+    }
+  }
+
+  // Marketplace manifests can list plugins by relative path; index those too so
+  // a marketplace repo exposes its plugins even without per-plugin manifests.
+  for (const filePath of files) {
+    const relFromRoot = toPosixPath(path.relative(rootPath, filePath));
+    if (!marker.marketplaceFiles.includes(relFromRoot)) {
+      continue;
+    }
+    const marketplaceRoot = rootPath;
+    const manifest = await readJsonFile(filePath);
+    const plugins = Array.isArray(manifest?.plugins) ? manifest.plugins : [];
+    for (const rawEntry of plugins) {
+      if (!rawEntry || typeof rawEntry !== 'object') {
+        continue;
+      }
+      const record = rawEntry as Record<string, unknown>;
+      const sourcePath = marketplaceSourcePath(record.source);
+      if (!sourcePath) {
+        continue;
+      }
+      const pluginRoot = path.resolve(marketplaceRoot, sourcePath);
+      if (!(await pathExists(pluginRoot))) {
+        continue;
+      }
+      if (!pluginRoots.has(pluginRoot)) {
+        pluginRoots.set(pluginRoot, safePluginName(record.name, pluginRoot));
+      }
+    }
+  }
+
+  if (pluginRoots.size === 0) {
+    return [];
+  }
+
+  const entries: DetectedEntry[] = [...pluginRoots.entries()]
+    .map(([pluginRoot, name]): DetectedEntry => {
+      const relative = path.relative(rootPath, pluginRoot);
+      const relativePath = relative === '' ? '.' : toPosixPath(relative);
+      return {
+        name,
+        relativePath,
+        rootRelativePath: relativePath,
+        adapter: marker.adapter,
+        kind: 'plugin',
+        warnings: [],
+      };
+    })
+    .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+
+  return [
+    {
+      adapter: marker.adapter,
+      label: marker.label,
+      relativeRoot: '',
+      kind: 'plugin',
+      nativeTargetRelativeRoot: nativePluginRoot(marker.adapter),
+      confidence: 100,
+      entries,
+    },
+  ];
+}
+
+async function detectPluginGroups(
+  rootPath: string,
+  adapter: AdapterId,
+): Promise<DetectedGroup[]> {
+  const marker = PLUGIN_MARKERS.find((candidate) => candidate.adapter === adapter);
+  if (!marker) {
+    return [];
+  }
+  const files = await walkFiles(rootPath);
+  return detectPluginGroupsForMarker(rootPath, files, marker);
+}
 
 function isNestedWithin(parentPath: string, candidatePath: string): boolean {
   const relativePath = path.relative(parentPath, candidatePath);
@@ -278,7 +464,11 @@ function createAdapter(id: AdapterId): SkillAdapter {
       const groups = await Promise.all(
         layouts.map((layout) => detectGroupsForLayout(rootPath, layout)),
       );
-      return groups.flat();
+      const flattened = groups.flat();
+      if (PLUGIN_ADAPTERS.includes(id)) {
+        flattened.push(...(await detectPluginGroups(rootPath, id)));
+      }
+      return flattened;
     },
     scoreCompatibility(report: InspectionReport): AdapterCompatibility {
       return buildCompatibility(id, report.groups);
@@ -306,6 +496,23 @@ function createAdapter(id: AdapterId): SkillAdapter {
           sourceRelativePath: entry.relativePath,
           sourceRootRelativePath,
           targetRelativePath: toPosixPath(path.join(SKILL_ROOTS[id], subPath)),
+        };
+      }
+
+      // Plugins land in AgentPM's managed per-agent marketplace directory,
+      // which the host consumes via `claude plugin marketplace add <root>` or
+      // `codex plugin marketplace add <root>`. Clamp the name to a single safe
+      // segment as defense-in-depth against an unsafe name reaching this far.
+      if (entry.kind === 'plugin') {
+        const safeName = SAFE_PLUGIN_NAME.test(entry.name)
+          ? entry.name
+          : path.basename(entry.name);
+        return {
+          name: safeName,
+          adapter: id,
+          sourceRelativePath: entry.relativePath,
+          sourceRootRelativePath,
+          targetRelativePath: pluginTargetRelativePath(id, safeName),
         };
       }
 
@@ -525,8 +732,15 @@ export function listInstallableEntries(
   });
 
   for (const entry of sorted) {
-    if (!seen.has(entry.relativePath)) {
-      seen.add(entry.relativePath);
+    // A plugin folder can carry both a Claude and a Codex manifest, yielding two
+    // entries at the same path for different agents; keep them distinct so each
+    // host can install its own. Skills stay deduped by path.
+    const key =
+      entry.kind === 'plugin'
+        ? `${entry.relativePath}::${entry.adapter}`
+        : entry.relativePath;
+    if (!seen.has(key)) {
+      seen.add(key);
       result.push(entry);
     }
   }

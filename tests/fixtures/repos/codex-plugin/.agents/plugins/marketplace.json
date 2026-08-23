@@ -1,0 +1,20 @@
+{
+  "name": "demo-codex-market",
+  "interface": {
+    "displayName": "Demo Codex marketplace"
+  },
+  "plugins": [
+    {
+      "name": "demo-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/demo-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

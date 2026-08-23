@@ -75,6 +75,12 @@ importers:
       '@agentpm/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@agentpm/registry':
+        specifier: workspace:*
+        version: link:../../packages/registry
+      '@agentpm/registry-server':
+        specifier: workspace:*
+        version: link:../../packages/registry-server
       '@agentpm/ui':
         specifier: workspace:*
         version: link:../../packages/ui
@@ -150,12 +156,21 @@ importers:
 
   packages/registry:
     dependencies:
+      '@agentpm/fs':
+        specifier: workspace:*
+        version: link:../fs
       '@agentpm/shared':
         specifier: workspace:*
         version: link:../shared
       js-yaml:
         specifier: ^4.1.0
         version: 4.1.1
+
+  packages/registry-server:
+    dependencies:
+      '@agentpm/shared':
+        specifier: workspace:*
+        version: link:../shared
 
   packages/shared: {}
 

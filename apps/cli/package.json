@@ -1,6 +1,6 @@
 {
   "name": "@travelhawk/agentpm",
-  "version": "0.9.2",
+  "version": "0.10.0",
   "license": "MIT",
   "description": "Git-native CLI for discovering, installing, syncing, and publishing AI agent skills.",
   "type": "module",
@@ -58,6 +58,8 @@
   },
   "devDependencies": {
     "@agentpm/core": "workspace:*",
+    "@agentpm/registry": "workspace:*",
+    "@agentpm/registry-server": "workspace:*",
     "@agentpm/ui": "workspace:*"
   }
 }

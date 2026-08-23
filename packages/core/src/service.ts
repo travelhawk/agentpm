@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +10,7 @@ import {
   getAdapter,
   inspectRepository,
   listInstallableEntries,
+  nativePluginRoot,
   nativeSkillRoot,
 } from '@agentpm/adapters';
 import {
@@ -28,6 +30,7 @@ import {
   ensureDir,
   ensureManagedLink,
   isBrokenLink,
+  materializeArchive,
   pathExists,
   removeManagedLink,
   walkFiles,
@@ -44,7 +47,7 @@ import {
   resolveReleasePath,
   runGitCommand,
 } from '@agentpm/git';
-import { loadRegistryIndex } from '@agentpm/registry';
+import { fetchSkillArchive, loadRegistryIndex } from '@agentpm/registry';
 import {
   AgentPmError,
   MANIFEST_VERSION,
@@ -60,6 +63,7 @@ import {
   type CacheCleanResult,
   type CatalogEntryRecord,
   type ContentKind,
+  type DetectedEntry,
   type DoctorFixAction,
   type DoctorFixResult,
   type DoctorIssue,
@@ -83,6 +87,7 @@ import {
   type AdoptResult,
   type MaterializedSkillRecord,
   type RefreshSourceResult,
+  type RegistryIndexEntry,
   type RuntimeContextEntry,
   type RuntimeContextGraph,
   type SearchResult,
@@ -112,6 +117,7 @@ export interface InstallOptions {
   ref?: string | null | undefined;
   revision?: string | null | undefined;
   target?: AdapterId | undefined;
+  kind?: EntryKind | undefined;
   from?: string | undefined;
   addSource?: boolean | undefined;
   yes?: boolean | undefined;
@@ -155,6 +161,7 @@ interface PreparedContent {
   revision: string | null;
   repoRoot: string;
   cacheKey: string | null;
+  archive?: { version: string } | undefined;
   cleanup?: (() => Promise<void>) | undefined;
 }
 
@@ -196,6 +203,9 @@ export interface SourceSkillEntry {
   adapter: AdapterId | null;
   description: string | null;
   repo: string;
+  archive?: boolean | undefined;
+  version?: string | null | undefined;
+  kind?: EntryKind | null | undefined;
   sourceId: string | null;
   sourceDisplayName: string;
 }
@@ -417,7 +427,7 @@ export class AgentPmService {
     const normalizedLocator = this.normalizeLocator(sourceToken, kind);
     const displayName = displayNameFromLocator(normalizedLocator);
     if (kind === 'registry') {
-      const registry = await loadRegistryIndex(normalizedLocator);
+      const registry = await loadRegistryIndex(normalizedLocator, this.env);
       const entries = registry.entries
         .filter(
           (entry) =>
@@ -431,7 +441,13 @@ export class AgentPmService {
           path: entry.path ?? null,
           adapter: entry.target ?? entry.adapterHint ?? null,
           description: entry.description ?? null,
-          repo: resolveRegistryRepo(normalizedLocator, entry.repo),
+          repo: resolveRegistryRepo(
+            normalizedLocator,
+            entry.archive ?? entry.repo ?? '',
+          ),
+          archive: entry.archive !== undefined,
+          version: entry.version ?? null,
+          kind: entry.kind ?? null,
           sourceId: null,
           sourceDisplayName: displayName,
         }));
@@ -744,53 +760,47 @@ export class AgentPmService {
           selector.relativePath = selection.entry.path;
         }
         const detectedEntries = listInstallableEntries(prepared.report).filter(
-          (entry) => !options.target || entry.adapter === options.target,
+          (entry) =>
+            (!options.target || entry.adapter === options.target) &&
+            (!options.kind || entry.kind === options.kind),
         );
-        const detectedEntry =
-          // 1. Exact relativePath match
-          detectedEntries.find((entry) => {
-            if (selector.relativePath) {
-              return entry.relativePath === selector.relativePath;
-            }
-            return selector.name ? entry.name === selector.name : false;
-          }) ??
-          // 2. Exact name match
-          detectedEntries.find(
-            (entry) => entry.name === selection.entry.name,
-          ) ??
-          // 3. Basename match — handles nested paths like composio-skills/doppler-automation
-          (selector.relativePath
-            ? detectedEntries.find(
-                (entry) =>
-                  path.basename(entry.relativePath) === selector.relativePath,
-              )
-            : undefined) ??
-          // 4. Basename of relativePath matches the name hint
-          (selector.name
-            ? detectedEntries.find(
-                (entry) => path.basename(entry.relativePath) === selector.name,
-              )
-            : undefined);
 
-        if (!detectedEntry) {
+        // Collect every entry that matches the requested selector, then resolve
+        // to one. When a name resolves to several distinct entries — e.g. a
+        // skill and a plugin, or the same name for two agents — offer a choice
+        // instead of silently picking the first.
+        const candidates = this.collectInstallCandidates(
+          detectedEntries,
+          selector,
+          selection.entry.name,
+        );
+
+        if (candidates.length === 0) {
           const targetSummary = options.target
             ? ` for target "${options.target}"`
             : '';
+          const kindSummary = options.kind ? ` of kind "${options.kind}"` : '';
           const availableNames = detectedEntries
             .slice(0, 20)
-            .map((e) => `  - ${e.name} (${e.relativePath})`)
+            .map((e) => `  - ${e.name} (${e.kind}, ${e.adapter}, ${e.relativePath})`)
             .join('\n');
           const moreNote =
             detectedEntries.length > 20
               ? `\n  ... and ${detectedEntries.length - 20} more`
               : '';
           throw new AgentPmError(
-            `Could not find installable entry "${selection.entry.name}"${targetSummary} in ${prepared.contentLocator}.` +
+            `Could not find installable entry "${selection.entry.name}"${targetSummary}${kindSummary} in ${prepared.contentLocator}.` +
               (detectedEntries.length > 0
                 ? `\n\nAvailable entries in this repository:\n${availableNames}${moreNote}`
                 : '\n\nNo installable entries (SKILL.md) were detected in this repository.'),
           );
         }
+
+        const detectedEntry = await this.resolveInstallCandidate(
+          selection.entry.name,
+          candidates,
+          options,
+        );
 
         const adapter = getAdapter(detectedEntry.adapter);
         const mapping = await adapter.install(detectedEntry, scopeRoot);
@@ -811,12 +821,16 @@ export class AgentPmService {
               )
             : null);
 
+        // The adapter is part of the identity so the same skill/plugin name can
+        // be installed for two agents (e.g. codex and claude) from one source
+        // without the second install overwriting the first record.
         const installId = makeId(
           'inst',
           selection.source.id,
           mapping.name,
           scope,
           scopeRoot,
+          mapping.adapter,
         );
         const savedInstall = this.db.saveInstall({
           id: installId,
@@ -843,6 +857,9 @@ export class AgentPmService {
           metadata: {
             sourceLocator: selection.source.locator,
             sourceKind: selection.source.kind,
+            ...(prepared.archive
+              ? { archive: true, archiveVersion: prepared.archive.version }
+              : {}),
           },
           createdAt: nowIso(),
           updatedAt: nowIso(),
@@ -851,6 +868,25 @@ export class AgentPmService {
         await this.recordGeneratedTargetInLocalGitExclude(savedInstall);
         await this.ensureGitignored(scopeRoot, targetPath, options.yes);
         installs.push(savedInstall);
+
+        if (detectedEntry.kind === 'plugin') {
+          const marketplaceName = await this.syncPluginMarketplace(
+            scopeRoot,
+            mapping.adapter,
+          );
+          const pluginRoot = path.join(
+            scopeRoot,
+            nativePluginRoot(mapping.adapter),
+          );
+          const cli = mapping.adapter === 'codex' ? 'codex' : 'claude';
+          const installVerb =
+            mapping.adapter === 'codex' ? 'add' : 'install';
+          this.reportStatus(
+            `Plugin ready. Enable it in ${cli === 'codex' ? 'Codex' : 'Claude Code'}:\n` +
+              `  ${cli} plugin marketplace add ${pluginRoot}\n` +
+              `  ${cli} plugin ${installVerb} ${mapping.name}@${marketplaceName}`,
+          );
+        }
       } finally {
         await prepared.cleanup?.();
       }
@@ -864,6 +900,98 @@ export class AgentPmService {
     return installs;
   }
 
+  // Gather every detected entry that matches the requested selector, preserving
+  // the previous match precedence (exact path/name, then basename fallbacks) but
+  // returning ALL matches at the winning precedence level so callers can detect
+  // and resolve same-name ambiguity.
+  private collectInstallCandidates(
+    detectedEntries: DetectedEntry[],
+    selector: { name?: string | undefined; relativePath?: string | undefined },
+    nameHint: string,
+  ): DetectedEntry[] {
+    const exact = detectedEntries.filter((entry) =>
+      selector.relativePath
+        ? entry.relativePath === selector.relativePath
+        : selector.name
+          ? entry.name === selector.name
+          : false,
+    );
+    if (exact.length > 0) {
+      return exact;
+    }
+
+    const byName = detectedEntries.filter((entry) => entry.name === nameHint);
+    if (byName.length > 0) {
+      return byName;
+    }
+
+    if (selector.relativePath) {
+      const byBasePath = detectedEntries.filter(
+        (entry) => path.basename(entry.relativePath) === selector.relativePath,
+      );
+      if (byBasePath.length > 0) {
+        return byBasePath;
+      }
+    }
+
+    if (selector.name) {
+      return detectedEntries.filter(
+        (entry) => path.basename(entry.relativePath) === selector.name,
+      );
+    }
+
+    return [];
+  }
+
+  private describeInstallCandidate(entry: DetectedEntry): string {
+    return `${entry.kind} for ${entry.adapter} (${entry.relativePath})`;
+  }
+
+  // Resolve one entry from candidates. A single candidate is used directly.
+  // Multiple distinct candidates for the same name are disambiguated by an
+  // interactive picker when available, otherwise a clear error naming the
+  // --kind / --target filters that would select one non-interactively.
+  private async resolveInstallCandidate(
+    name: string,
+    candidates: DetectedEntry[],
+    options: InstallOptions,
+  ): Promise<DetectedEntry> {
+    const distinct = new Map<string, DetectedEntry>();
+    for (const entry of candidates) {
+      distinct.set(`${entry.kind}::${entry.adapter}::${entry.relativePath}`, entry);
+    }
+    const unique = [...distinct.values()].sort((left, right) => {
+      if (left.kind !== right.kind) return left.kind.localeCompare(right.kind);
+      if (left.adapter !== right.adapter)
+        return left.adapter.localeCompare(right.adapter);
+      return left.relativePath.localeCompare(right.relativePath);
+    });
+
+    if (unique.length === 1) {
+      return unique[0]!;
+    }
+
+    const listing = unique
+      .map((entry) => `  - ${this.describeInstallCandidate(entry)}`)
+      .join('\n');
+
+    if (!options.yes && this.prompts.selectOne) {
+      return this.prompts.selectOne(
+        `"${name}" matches more than one entry. Which do you want to install?`,
+        unique.map((entry) => ({
+          label: `${entry.kind} · ${entry.adapter}`,
+          description: entry.relativePath,
+          value: entry,
+        })),
+      );
+    }
+
+    throw new AgentPmError(
+      `"${name}" matches more than one installable entry:\n${listing}\n\n` +
+        'Narrow it with --kind <skill|agent|subagent|plugin> and/or --target <codex|claude|generic>.',
+    );
+  }
+
   async previewUpdates(options: UpdateOptions = {}): Promise<UpdatePreview[]> {
     await this.initialize();
     const installs = this.filterInstallsByName(options.names);
@@ -871,6 +999,10 @@ export class AgentPmService {
 
     for (const install of installs) {
       const source = this.db.getSource(install.sourceId);
+      if (install.metadata.archive === true) {
+        previews.push(await this.previewArchiveInstallUpdate(install, source));
+        continue;
+      }
       if (install.contentKind === 'local') {
         previews.push(await this.previewLocalInstallUpdate(install, source));
         continue;
@@ -943,6 +1075,7 @@ export class AgentPmService {
     previews: UpdatePreview[],
     options: UpdateOptions,
   ): Promise<UpdatePreview[]> {
+    const pluginMarketplaces = new Map<string, { scopeRoot: string; adapter: AdapterId }>();
     for (const preview of previews) {
       if (!preview.changed || !preview.nextLinkTarget) {
         continue;
@@ -968,8 +1101,12 @@ export class AgentPmService {
           preview.install.targetPath,
           preview.nextLinkTarget,
         );
+        // Both git and archive installs materialize into a per-revision
+        // release under their cache key, so recompute the source-relative path
+        // against that release path.
         const nextSourceRelativePath =
-          preview.install.contentKind === 'git' &&
+          (preview.install.contentKind === 'git' ||
+            preview.install.metadata.archive === true) &&
           preview.install.cacheKey &&
           preview.candidateRevision
             ? path
@@ -990,11 +1127,27 @@ export class AgentPmService {
           installedRevision: preview.candidateRevision,
           updatedAt: nowIso(),
         });
+
+        if (this.isPluginInstall(preview.install)) {
+          pluginMarketplaces.set(
+            `${preview.install.scopeRoot}::${preview.install.adapter}`,
+            {
+              scopeRoot: preview.install.scopeRoot,
+              adapter: preview.install.adapter,
+            },
+          );
+        }
       } catch (error) {
         throw new AgentPmError(
           `Failed to update "${preview.install.name}": ${error instanceof Error ? error.message : String(error)}`,
         );
       }
+    }
+
+    // Refresh each affected plugin marketplace once so its manifest reflects
+    // the updated plugin versions/descriptions.
+    for (const { scopeRoot, adapter } of pluginMarketplaces.values()) {
+      await this.syncPluginMarketplace(scopeRoot, adapter);
     }
 
     return previews;
@@ -2650,9 +2803,12 @@ export class AgentPmService {
       }
 
       if (
+        install.metadata.archive !== true &&
         install.contentKind === 'local' &&
         !(await pathExists(install.contentLocator))
       ) {
+        // Archive installs record contentKind 'local' with an http(s) archive
+        // URL as the locator, so the on-disk existence check does not apply.
         issues.push({
           severity: 'error',
           code: 'source-content-missing',
@@ -2780,7 +2936,7 @@ export class AgentPmService {
   private async reindexSource(source: SourceRecord): Promise<AddSourceResult> {
     this.reportStatus(`Indexing skills from ${source.displayName}...`);
     if (source.kind === 'registry') {
-      const registry = await loadRegistryIndex(source.locator);
+      const registry = await loadRegistryIndex(source.locator, this.env);
       const entries = this.catalogEntriesFromRegistry(source, registry.entries);
       this.db.replaceCatalogEntries(source.id, entries);
       return { source, indexedEntries: entries.length };
@@ -2812,31 +2968,51 @@ export class AgentPmService {
 
   private catalogEntriesFromRegistry(
     source: Pick<SourceRecord, 'id' | 'locator'>,
-    entries: Array<{
-      name: string;
-      description?: string | undefined;
-      repo: string;
-      ref?: string | undefined;
-      path?: string | undefined;
-      adapterHint?: AdapterId | undefined;
-      target?: AdapterId | undefined;
-      tags?: string[] | undefined;
-    }>,
+    entries: RegistryIndexEntry[],
   ): CatalogEntryRecord[] {
-    return entries.map((entry) => ({
-      id: makeId('cat', source.id, entry.name, entry.repo, entry.path ?? ''),
-      sourceId: source.id,
-      name: entry.name,
-      description: entry.description ?? null,
-      repo: resolveRegistryRepo(source.locator, entry.repo),
-      ref: entry.ref ?? null,
-      path: entry.path ?? null,
-      adapterHint: entry.target ?? entry.adapterHint ?? null,
-      tags: entry.tags ?? [],
-      metadata: {},
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-    }));
+    const seen = new Set<string>();
+    return entries.map((entry) => {
+      const location = entry.archive ?? entry.repo ?? '';
+      // Archive URLs change per published version, so key catalog identity by
+      // name plus the stable target/kind/path (never the URL) — installs keep
+      // matching across versions, while same-name-per-target entries stay
+      // distinct instead of colliding on the primary key.
+      const id = makeId(
+        'cat',
+        source.id,
+        entry.name,
+        entry.archive ? 'archive' : location,
+        entry.target ?? entry.adapterHint ?? '',
+        entry.kind ?? '',
+        entry.path ?? '',
+      );
+      if (seen.has(id)) {
+        throw new AgentPmError(
+          `Registry index ${source.locator} has duplicate entries named "${entry.name}" for the same target and path; entry names must be unique per target.`,
+        );
+      }
+      seen.add(id);
+      return {
+        id,
+        sourceId: source.id,
+        name: entry.name,
+        description: entry.description ?? null,
+        repo: resolveRegistryRepo(source.locator, location),
+        ref: entry.ref ?? null,
+        path: entry.path ?? null,
+        adapterHint: entry.target ?? entry.adapterHint ?? null,
+        tags: entry.tags ?? [],
+        metadata: entry.archive
+          ? {
+              archive: true,
+              archiveVersion: entry.version ?? null,
+              archiveKind: entry.kind ?? null,
+            }
+          : {},
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+    });
   }
 
   private catalogEntriesFromInspection(
@@ -2845,7 +3021,17 @@ export class AgentPmService {
     report: InspectionReport,
   ): CatalogEntryRecord[] {
     return listInstallableEntries(report).map((entry) => ({
-      id: makeId('cat', sourceId, entry.name, entry.relativePath),
+      // Include adapter and kind so a plugin carrying both a Claude and a Codex
+      // manifest (same name and path, different agent) produces two distinct
+      // catalog rows instead of colliding on the primary key.
+      id: makeId(
+        'cat',
+        sourceId,
+        entry.name,
+        entry.relativePath,
+        entry.adapter,
+        entry.kind,
+      ),
       sourceId,
       name: entry.name,
       description: null,
@@ -2854,10 +3040,23 @@ export class AgentPmService {
       path: entry.relativePath,
       adapterHint: entry.adapter,
       tags: [entry.adapter, entry.kind],
-      metadata: {},
+      metadata: { kind: entry.kind },
       createdAt: nowIso(),
       updatedAt: nowIso(),
     }));
+  }
+
+  private catalogEntryKind(entry: CatalogEntryRecord): EntryKind | null {
+    const known: EntryKind[] = ['skill', 'agent', 'subagent', 'plugin'];
+    const isKind = (value: unknown): value is EntryKind =>
+      typeof value === 'string' && (known as string[]).includes(value);
+    if (isKind(entry.metadata.kind)) {
+      return entry.metadata.kind;
+    }
+    if (entry.metadata.archive === true && isKind(entry.metadata.archiveKind)) {
+      return entry.metadata.archiveKind;
+    }
+    return entry.tags.find((tag): tag is EntryKind => isKind(tag)) ?? null;
   }
 
   private annotateInspectionForRequest(
@@ -3421,7 +3620,13 @@ export class AgentPmService {
           path: entry.path,
           adapterHint: entry.adapter,
           tags: entry.adapter ? [entry.adapter] : [],
-          metadata: {},
+          metadata: entry.archive
+            ? {
+                archive: true,
+                archiveVersion: entry.version ?? null,
+                archiveKind: entry.kind ?? null,
+              }
+            : {},
           createdAt: nowIso(),
           updatedAt: nowIso(),
         }) satisfies CatalogEntryRecord,
@@ -3625,6 +3830,7 @@ export class AgentPmService {
           entries,
           requestedNames,
           options.target,
+          options.kind,
         );
       }
 
@@ -3769,37 +3975,20 @@ export class AgentPmService {
         .filter(
           (entry) =>
             matchesCatalogEntrySelector(entry, requestedName) &&
-            matchesCatalogEntryTarget(entry, options.target),
+            matchesCatalogEntryTarget(entry, options.target) &&
+            (!options.kind || this.catalogEntryKind(entry) === options.kind),
         );
       if (matches.length === 0) {
         const targetSummary = options.target
           ? ` for target "${options.target}"`
           : '';
+        const kindSummary = options.kind ? ` of kind "${options.kind}"` : '';
         throw new AgentPmError(
-          `No catalog entry named "${requestedName}"${targetSummary} found.`,
+          `No catalog entry named "${requestedName}"${targetSummary}${kindSummary} found.`,
         );
       }
 
-      let entry = matches[0]!;
-      if (matches.length > 1) {
-        if (!this.prompts.selectOne) {
-          throw new AgentPmError(
-            `Multiple catalog entries named "${requestedName}" found. Re-run interactively.`,
-          );
-        }
-        entry = await this.prompts.selectOne(
-          `Choose which "${requestedName}" entry to install:`,
-          matches.map((candidate) => {
-            const source = this.db.getSource(candidate.sourceId);
-            return {
-              label: `${candidate.name} (${source?.displayName ?? candidate.sourceId})`,
-              description: candidate.repo,
-              value: candidate,
-            };
-          }),
-        );
-      }
-
+      const entry = await this.chooseCatalogEntry(requestedName, matches, options);
       const source = this.db.getSource(entry.sourceId);
       if (!source) {
         throw new AgentPmError(
@@ -3812,50 +4001,82 @@ export class AgentPmService {
     return selections;
   }
 
+  // Choose one catalog entry when a name resolves to several. Distinct entries
+  // that differ by kind or agent get an interactive picker (labeled by kind and
+  // agent) or, non-interactively, a clear error naming the --kind/--target
+  // filters. Entries that are the same target across sources keep the first.
+  private async chooseCatalogEntry(
+    requestedName: string,
+    matches: CatalogEntryRecord[],
+    options: InstallOptions,
+  ): Promise<CatalogEntryRecord> {
+    if (matches.length === 1) {
+      return matches[0]!;
+    }
+
+    const describe = (entry: CatalogEntryRecord): string => {
+      const kind = this.catalogEntryKind(entry) ?? 'entry';
+      const agent = entry.adapterHint ?? 'unknown';
+      return `${kind} · ${agent}`;
+    };
+
+    if (!options.yes && this.prompts.selectOne) {
+      return this.prompts.selectOne(
+        `"${requestedName}" matches more than one entry. Which do you want to install?`,
+        matches.map((candidate) => {
+          const source = this.db.getSource(candidate.sourceId);
+          return {
+            label: `${candidate.name} · ${describe(candidate)}`,
+            description: source
+              ? `${source.displayName} · ${candidate.path ?? candidate.repo}`
+              : (candidate.path ?? candidate.repo),
+            value: candidate,
+          };
+        }),
+      );
+    }
+
+    const listing = matches
+      .map((candidate) => {
+        const source = this.db.getSource(candidate.sourceId);
+        return `  - ${describe(candidate)}${source ? ` in ${source.displayName}` : ''} (${candidate.path ?? candidate.repo})`;
+      })
+      .join('\n');
+    throw new AgentPmError(
+      `"${requestedName}" matches more than one installable entry:\n${listing}\n\n` +
+        'Narrow it with --kind <skill|agent|subagent|plugin> and/or --target <codex|claude|generic>.',
+    );
+  }
+
   private async resolveNamedSelectionsFromSource(
     source: SourceRecord,
     entries: CatalogEntryRecord[],
     selectors: string[],
     target?: AdapterId,
+    kind?: EntryKind,
   ): Promise<Array<{ source: SourceRecord; entry: CatalogEntryRecord }>> {
     const selections: Array<{
       source: SourceRecord;
       entry: CatalogEntryRecord;
     }> = [];
     for (const selector of selectors) {
-      const matches = entries.filter((entry) =>
-        matchesCatalogEntrySelector(entry, selector),
+      const matches = entries.filter(
+        (entry) =>
+          matchesCatalogEntrySelector(entry, selector) &&
+          (!kind || this.catalogEntryKind(entry) === kind),
       );
       if (matches.length === 0) {
         const targetSummary = target ? ` for target "${target}"` : '';
+        const kindSummary = kind ? ` of kind "${kind}"` : '';
         throw new AgentPmError(
-          `No catalog entry named "${selector}"${targetSummary} found in source ${source.displayName}.`,
+          `No catalog entry named "${selector}"${targetSummary}${kindSummary} found in source ${source.displayName}.`,
         );
       }
 
-      let entry = matches[0]!;
-      if (matches.length > 1) {
-        if (!this.prompts.selectOne) {
-          const available = matches
-            .map(
-              (candidate) =>
-                `  - ${candidate.name} (${candidate.path ?? candidate.repo})`,
-            )
-            .join('\n');
-          throw new AgentPmError(
-            `Multiple entries named "${selector}" were found in source ${source.displayName}. Re-run interactively or use a more specific path selector.\n\nMatches:\n${available}`,
-          );
-        }
-        entry = await this.prompts.selectOne(
-          `Choose which "${selector}" entry to install from ${source.displayName}:`,
-          matches.map((candidate) => ({
-            label: candidate.name,
-            description: `${candidate.adapterHint ?? 'unknown'}  ${candidate.path ?? candidate.repo}`,
-            value: candidate,
-          })),
-        );
-      }
-
+      const entry = await this.chooseCatalogEntry(selector, matches, {
+        target,
+        kind,
+      });
       selections.push({ source, entry });
     }
 
@@ -3894,6 +4115,9 @@ export class AgentPmService {
       revision?: string | null | undefined;
     },
   ): Promise<PreparedContent> {
+    if (entry.metadata.archive === true) {
+      return this.prepareArchiveContent(entry);
+    }
     const contentLocator = this.resolveContentLocator(entry.repo);
     const requestedRef =
       overrides.revision ?? overrides.ref ?? entry.ref ?? null;
@@ -3914,6 +4138,19 @@ export class AgentPmService {
         cacheKey: null,
       };
     }
+    // Plugin roots can contain arbitrary directories (.claude-plugin, commands,
+    // hooks, ...), so a plugin at the repository root needs a full checkout; a
+    // nested plugin is covered by its own subtree sparse path.
+    const isPlugin = entry.tags.includes('plugin');
+    if (isPlugin && (!entry.path || entry.path === '.')) {
+      return this.prepareGitContent(contentLocator, {
+        sourceId: source.id,
+        ref: requestedRef,
+        revision: overrides.revision ?? null,
+        sparsePaths: [],
+        requireFullCheckout: true,
+      });
+    }
     return this.prepareGitContent(contentLocator, {
       sourceId: source.id,
       ref: requestedRef,
@@ -3922,29 +4159,101 @@ export class AgentPmService {
     });
   }
 
+  // Registry-server entries carry an archive URL instead of a git repo. The
+  // archive is a JSON file bundle that is materialized into a per-revision
+  // release directory under the cache, mirroring the git cache layout so
+  // installs can symlink into it and updates can swap revisions.
+  private async prepareArchiveContent(
+    entry: CatalogEntryRecord,
+  ): Promise<PreparedContent> {
+    const url = entry.repo;
+    this.reportStatus(`Downloading skill archive for ${entry.name}...`);
+    const { archive, raw } = await fetchSkillArchive(url, this.env);
+    const revision = createHash('sha256').update(raw).digest('hex');
+    const cacheKey = makeId('cache', 'archive', entry.sourceId, entry.name);
+    const cacheBasePath = this.cacheBasePath(cacheKey);
+    const releasePath = resolveReleasePath(cacheBasePath, revision);
+    const rootDir =
+      archive.kind === 'skill' || archive.kind === 'subagent'
+        ? path.join(releasePath, 'skills', archive.name)
+        : path.join(releasePath, archive.name);
+
+    if (!(await pathExists(rootDir))) {
+      await fs.rm(releasePath, { recursive: true, force: true });
+      await materializeArchive(archive, rootDir);
+    }
+
+    const report = await inspectRepository(releasePath, url, 'local');
+    this.db.saveCacheRepo({
+      cacheKey,
+      sourceId: entry.sourceId,
+      locator: url,
+      kind: 'local',
+      basePath: cacheBasePath,
+      currentRevision: revision,
+      isGit: false,
+      layoutSignature: report.layoutSignature,
+      metadata: {
+        archive: true,
+        archiveVersion: archive.version,
+        archiveKind: archive.kind,
+      },
+      updatedAt: nowIso(),
+    });
+
+    return {
+      report,
+      contentKind: 'local',
+      contentLocator: url,
+      contentRef: null,
+      revision,
+      repoRoot: releasePath,
+      cacheKey,
+      archive: { version: archive.version },
+    };
+  }
+
   private async prepareGitCandidateFromInstall(
     install: InstallRecord,
     revision: string,
   ): Promise<PreparedContent> {
-    const cacheKey = makeId(
-      'cache',
-      install.contentLocator,
-      install.contentRef ?? 'HEAD',
-    );
+    // Reuse the install's own cache key. Deriving a fresh key from (locator,
+    // ref) diverges from the install-time key whenever the install pinned a
+    // revision (e.g. from `agentpm sync`), which left the materialized release
+    // untracked in cache_repos — so `cache clean` would delete the live
+    // install content. Registering the cache row keeps that sweep away.
+    const cacheKey =
+      install.cacheKey ??
+      makeId('cache', install.contentLocator, install.contentRef ?? 'HEAD');
+    const cacheBasePath = this.cacheBasePath(cacheKey);
     const release = await materializeGitRelease({
       locator: install.contentLocator,
-      basePath: this.cacheBasePath(cacheKey),
+      basePath: cacheBasePath,
       sparsePaths: normalizeSparsePaths([install.sourceRelativePath]),
       ref: install.contentRef,
       revision,
       env: this.env,
     });
+    const report = await inspectRepository(
+      release.releasePath,
+      install.contentLocator,
+      'git',
+    );
+    const existingCache = this.db.getCacheRepo(cacheKey);
+    this.db.saveCacheRepo({
+      cacheKey,
+      sourceId: existingCache?.sourceId ?? install.sourceId,
+      locator: install.contentLocator,
+      kind: 'git',
+      basePath: cacheBasePath,
+      currentRevision: release.revision,
+      isGit: true,
+      layoutSignature: report.layoutSignature,
+      metadata: existingCache?.metadata ?? {},
+      updatedAt: nowIso(),
+    });
     return {
-      report: await inspectRepository(
-        release.releasePath,
-        install.contentLocator,
-        'git',
-      ),
+      report,
       contentKind: 'git',
       contentLocator: install.contentLocator,
       contentRef: install.contentRef,
@@ -4115,7 +4424,127 @@ export class AgentPmService {
       });
     }
 
+    // If this was a plugin install, refresh its agent's managed marketplace.
+    if (this.isPluginInstall(install)) {
+      await this.syncPluginMarketplace(install.scopeRoot, install.adapter);
+    }
+
     return install;
+  }
+
+  private isPluginInstall(install: InstallRecord): boolean {
+    const pluginRoot = path.resolve(
+      install.scopeRoot,
+      nativePluginRoot(install.adapter),
+    );
+    return path
+      .resolve(install.targetPath)
+      .startsWith(pluginRoot + path.sep);
+  }
+
+  // Keeps a managed plugin marketplace in sync with the plugin directories
+  // AgentPM installs under <scopeRoot>/.agentpm/plugins/<adapter>/plugins/*, in
+  // the native format each host discovers:
+  //   claude -> <root>/.claude-plugin/marketplace.json
+  //   codex  -> <root>/.agents/plugins/marketplace.json
+  // Returns the marketplace name.
+  private async syncPluginMarketplace(
+    scopeRoot: string,
+    adapter: AdapterId,
+  ): Promise<string> {
+    const root = path.join(scopeRoot, nativePluginRoot(adapter));
+    const pluginsRoot = path.join(root, 'plugins');
+    const marketplaceName =
+      path.resolve(scopeRoot) === path.resolve(os.homedir())
+        ? 'agentpm'
+        : `agentpm-${slugify(path.basename(scopeRoot))}`;
+    const manifestRelDir =
+      adapter === 'codex' ? path.join('.agents', 'plugins') : '.claude-plugin';
+    const manifestPath = path.join(root, manifestRelDir, 'marketplace.json');
+
+    const discovered: Array<{
+      name: string;
+      description?: string | undefined;
+      version?: string | undefined;
+    }> = [];
+    if (await pathExists(pluginsRoot)) {
+      const children = await fs.readdir(pluginsRoot, { withFileTypes: true });
+      for (const child of children.sort((a, b) => a.name.localeCompare(b.name))) {
+        const childPath = path.join(pluginsRoot, child.name);
+        try {
+          const stats = await fs.stat(childPath);
+          if (!stats.isDirectory()) {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        const manifestDir =
+          adapter === 'codex' ? '.codex-plugin' : '.claude-plugin';
+        let description: string | undefined;
+        let version: string | undefined;
+        try {
+          const manifest = JSON.parse(
+            await fs.readFile(
+              path.join(childPath, manifestDir, 'plugin.json'),
+              'utf8',
+            ),
+          ) as Record<string, unknown>;
+          description =
+            typeof manifest.description === 'string'
+              ? manifest.description
+              : undefined;
+          version =
+            typeof manifest.version === 'string' ? manifest.version : undefined;
+        } catch {
+          // Plugins without their own manifest are still listed by path.
+        }
+        discovered.push({ name: child.name, description, version });
+      }
+    }
+
+    if (discovered.length === 0) {
+      await fs.rm(path.join(root, manifestRelDir), {
+        recursive: true,
+        force: true,
+      });
+      return marketplaceName;
+    }
+
+    const manifest =
+      adapter === 'codex'
+        ? {
+            name: marketplaceName,
+            interface: { displayName: 'AgentPM' },
+            plugins: discovered.map((plugin) => ({
+              name: plugin.name,
+              source: { source: 'local', path: `./plugins/${plugin.name}` },
+              policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+              ...(plugin.description
+                ? { description: plugin.description }
+                : {}),
+            })),
+          }
+        : {
+            name: marketplaceName,
+            owner: { name: 'AgentPM' },
+            plugins: discovered.map((plugin) => ({
+              name: plugin.name,
+              source: `./plugins/${plugin.name}`,
+              ...(plugin.description
+                ? { description: plugin.description }
+                : {}),
+              ...(plugin.version ? { version: plugin.version } : {}),
+            })),
+          };
+
+    await ensureDir(path.dirname(manifestPath));
+    await fs.writeFile(
+      manifestPath,
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      'utf8',
+    );
+    return marketplaceName;
   }
 
   private async previewLocalInstallUpdate(
@@ -4142,6 +4571,102 @@ export class AgentPmService {
         ? ['Live local folder install; detailed diff is not available.']
         : ['Source path is missing.'],
       nextLinkTarget: currentExists ? currentPath : null,
+    };
+  }
+
+  private async previewArchiveInstallUpdate(
+    install: InstallRecord,
+    source: SourceRecord | null,
+  ): Promise<UpdatePreview> {
+    // Registry archive URLs are version-pinned, so only a catalog reindex
+    // surfaces a newer version. Do it here (transient one-off `--from` sources
+    // are skipped by refreshSources), giving archive installs the same live
+    // update behavior as git installs.
+    if (source && source.kind === 'registry') {
+      try {
+        await this.reindexSource(source);
+      } catch {
+        // Fall back to the cached catalog entry / install-time URL below.
+      }
+    }
+    // Prefer the freshest catalog entry (refresh replaces archive URLs when a
+    // new version is published); fall back to the URL recorded at install time.
+    const entry = this.db
+      .listCatalogEntriesBySource(install.sourceId)
+      .find(
+        (candidate) =>
+          candidate.metadata.archive === true &&
+          candidate.name === install.name,
+      );
+
+    let prepared: PreparedContent;
+    try {
+      prepared = entry
+        ? await this.prepareArchiveContent(entry)
+        : await this.prepareArchiveContent({
+            id: install.catalogEntryId ?? install.id,
+            sourceId: install.sourceId,
+            name: install.name,
+            description: null,
+            repo: install.contentLocator,
+            ref: null,
+            path: null,
+            adapterHint: install.adapter,
+            tags: [],
+            metadata: { archive: true },
+            createdAt: install.createdAt,
+            updatedAt: install.updatedAt,
+          });
+    } catch (error) {
+      return {
+        install,
+        source,
+        changed: false,
+        currentRevision: install.installedRevision,
+        candidateRevision: null,
+        diff: [],
+        risk: 'breaking',
+        warnings: [
+          `Could not check the registry for updates: ${error instanceof Error ? error.message : String(error)}`,
+        ],
+        nextLinkTarget: null,
+      };
+    }
+
+    if (prepared.revision === install.installedRevision) {
+      return {
+        install,
+        source,
+        changed: false,
+        currentRevision: install.installedRevision,
+        candidateRevision: prepared.revision,
+        diff: [],
+        risk: 'safe',
+        warnings: [],
+        nextLinkTarget: install.linkTarget,
+      };
+    }
+
+    const adapter = getAdapter(install.adapter);
+    const updateResult = adapter.update(install, prepared.report);
+    const nextLinkTarget = updateResult.nextRelativePath
+      ? path.join(prepared.repoRoot, updateResult.nextRelativePath)
+      : null;
+    const diff =
+      nextLinkTarget && (await pathExists(install.linkTarget))
+        ? await diffTrees(install.linkTarget, nextLinkTarget)
+        : [];
+
+    return {
+      install,
+      source,
+      changed: true,
+      currentRevision: install.installedRevision,
+      candidateRevision: prepared.revision,
+      diff,
+      risk: updateResult.risk,
+      warnings: updateResult.warnings,
+      nextLinkTarget,
     };
   }
 }

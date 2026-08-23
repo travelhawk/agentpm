@@ -275,22 +275,45 @@ export async function promptToInput(
   options: {
     defaultValue?: string | undefined;
     placeholder?: string | undefined;
+    mask?: boolean | undefined;
   } = {},
 ): Promise<string> {
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
     throw new AgentPmError('Interactive text input requires a TTY.');
   }
 
+  const output = process.stdout;
   const rl = createInterface({
     input: process.stdin,
-    output: process.stdout,
+    output,
+    terminal: true,
   });
+  // Muted echo for secrets: swallow the echoed characters while typing.
+  let muted = false;
+  if (options.mask) {
+    const write = output.write.bind(output);
+    (rl as unknown as { _writeToOutput: (chunk: string) => void })._writeToOutput = (
+      chunk: string,
+    ) => {
+      if (muted) {
+        // Preserve newlines so Enter still moves the cursor.
+        write(chunk.includes('\n') ? '\n' : '');
+        return;
+      }
+      write(chunk);
+    };
+  }
   try {
     const suffix = [
       options.placeholder ? ` (${options.placeholder})` : '',
       options.defaultValue ? ` [default: ${options.defaultValue}]` : '',
     ].join('');
-    const answer = await rl.question(`${message}${suffix}: `);
+    const questionPromise = rl.question(`${message}${suffix}: `);
+    muted = Boolean(options.mask);
+    const answer = await questionPromise;
+    if (options.mask) {
+      output.write('\n');
+    }
     const value = answer.trim();
     return value || options.defaultValue || '';
   } finally {

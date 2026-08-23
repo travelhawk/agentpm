@@ -91,6 +91,13 @@ async function createFakeNpx(binRoot: string): Promise<string> {
     '@echo off\r\nnode "%~dp0\\npx.js" %*\r\n',
     'utf8',
   );
+  const posixShim = path.join(binDir, 'npx');
+  await fs.writeFile(
+    posixShim,
+    '#!/bin/sh\nexec node "$(dirname "$0")/npx.js" "$@"\n',
+    'utf8',
+  );
+  await fs.chmod(posixShim, 0o755);
   return binDir;
 }
 
