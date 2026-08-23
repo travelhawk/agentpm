@@ -63,6 +63,7 @@ import {
   type CacheCleanResult,
   type CatalogEntryRecord,
   type ContentKind,
+  type DetectedEntry,
   type DoctorFixAction,
   type DoctorFixResult,
   type DoctorIssue,
@@ -116,6 +117,7 @@ export interface InstallOptions {
   ref?: string | null | undefined;
   revision?: string | null | undefined;
   target?: AdapterId | undefined;
+  kind?: EntryKind | undefined;
   from?: string | undefined;
   addSource?: boolean | undefined;
   yes?: boolean | undefined;
@@ -758,53 +760,47 @@ export class AgentPmService {
           selector.relativePath = selection.entry.path;
         }
         const detectedEntries = listInstallableEntries(prepared.report).filter(
-          (entry) => !options.target || entry.adapter === options.target,
+          (entry) =>
+            (!options.target || entry.adapter === options.target) &&
+            (!options.kind || entry.kind === options.kind),
         );
-        const detectedEntry =
-          // 1. Exact relativePath match
-          detectedEntries.find((entry) => {
-            if (selector.relativePath) {
-              return entry.relativePath === selector.relativePath;
-            }
-            return selector.name ? entry.name === selector.name : false;
-          }) ??
-          // 2. Exact name match
-          detectedEntries.find(
-            (entry) => entry.name === selection.entry.name,
-          ) ??
-          // 3. Basename match — handles nested paths like composio-skills/doppler-automation
-          (selector.relativePath
-            ? detectedEntries.find(
-                (entry) =>
-                  path.basename(entry.relativePath) === selector.relativePath,
-              )
-            : undefined) ??
-          // 4. Basename of relativePath matches the name hint
-          (selector.name
-            ? detectedEntries.find(
-                (entry) => path.basename(entry.relativePath) === selector.name,
-              )
-            : undefined);
 
-        if (!detectedEntry) {
+        // Collect every entry that matches the requested selector, then resolve
+        // to one. When a name resolves to several distinct entries — e.g. a
+        // skill and a plugin, or the same name for two agents — offer a choice
+        // instead of silently picking the first.
+        const candidates = this.collectInstallCandidates(
+          detectedEntries,
+          selector,
+          selection.entry.name,
+        );
+
+        if (candidates.length === 0) {
           const targetSummary = options.target
             ? ` for target "${options.target}"`
             : '';
+          const kindSummary = options.kind ? ` of kind "${options.kind}"` : '';
           const availableNames = detectedEntries
             .slice(0, 20)
-            .map((e) => `  - ${e.name} (${e.relativePath})`)
+            .map((e) => `  - ${e.name} (${e.kind}, ${e.adapter}, ${e.relativePath})`)
             .join('\n');
           const moreNote =
             detectedEntries.length > 20
               ? `\n  ... and ${detectedEntries.length - 20} more`
               : '';
           throw new AgentPmError(
-            `Could not find installable entry "${selection.entry.name}"${targetSummary} in ${prepared.contentLocator}.` +
+            `Could not find installable entry "${selection.entry.name}"${targetSummary}${kindSummary} in ${prepared.contentLocator}.` +
               (detectedEntries.length > 0
                 ? `\n\nAvailable entries in this repository:\n${availableNames}${moreNote}`
                 : '\n\nNo installable entries (SKILL.md) were detected in this repository.'),
           );
         }
+
+        const detectedEntry = await this.resolveInstallCandidate(
+          selection.entry.name,
+          candidates,
+          options,
+        );
 
         const adapter = getAdapter(detectedEntry.adapter);
         const mapping = await adapter.install(detectedEntry, scopeRoot);
@@ -902,6 +898,98 @@ export class AgentPmService {
     }
 
     return installs;
+  }
+
+  // Gather every detected entry that matches the requested selector, preserving
+  // the previous match precedence (exact path/name, then basename fallbacks) but
+  // returning ALL matches at the winning precedence level so callers can detect
+  // and resolve same-name ambiguity.
+  private collectInstallCandidates(
+    detectedEntries: DetectedEntry[],
+    selector: { name?: string | undefined; relativePath?: string | undefined },
+    nameHint: string,
+  ): DetectedEntry[] {
+    const exact = detectedEntries.filter((entry) =>
+      selector.relativePath
+        ? entry.relativePath === selector.relativePath
+        : selector.name
+          ? entry.name === selector.name
+          : false,
+    );
+    if (exact.length > 0) {
+      return exact;
+    }
+
+    const byName = detectedEntries.filter((entry) => entry.name === nameHint);
+    if (byName.length > 0) {
+      return byName;
+    }
+
+    if (selector.relativePath) {
+      const byBasePath = detectedEntries.filter(
+        (entry) => path.basename(entry.relativePath) === selector.relativePath,
+      );
+      if (byBasePath.length > 0) {
+        return byBasePath;
+      }
+    }
+
+    if (selector.name) {
+      return detectedEntries.filter(
+        (entry) => path.basename(entry.relativePath) === selector.name,
+      );
+    }
+
+    return [];
+  }
+
+  private describeInstallCandidate(entry: DetectedEntry): string {
+    return `${entry.kind} for ${entry.adapter} (${entry.relativePath})`;
+  }
+
+  // Resolve one entry from candidates. A single candidate is used directly.
+  // Multiple distinct candidates for the same name are disambiguated by an
+  // interactive picker when available, otherwise a clear error naming the
+  // --kind / --target filters that would select one non-interactively.
+  private async resolveInstallCandidate(
+    name: string,
+    candidates: DetectedEntry[],
+    options: InstallOptions,
+  ): Promise<DetectedEntry> {
+    const distinct = new Map<string, DetectedEntry>();
+    for (const entry of candidates) {
+      distinct.set(`${entry.kind}::${entry.adapter}::${entry.relativePath}`, entry);
+    }
+    const unique = [...distinct.values()].sort((left, right) => {
+      if (left.kind !== right.kind) return left.kind.localeCompare(right.kind);
+      if (left.adapter !== right.adapter)
+        return left.adapter.localeCompare(right.adapter);
+      return left.relativePath.localeCompare(right.relativePath);
+    });
+
+    if (unique.length === 1) {
+      return unique[0]!;
+    }
+
+    const listing = unique
+      .map((entry) => `  - ${this.describeInstallCandidate(entry)}`)
+      .join('\n');
+
+    if (!options.yes && this.prompts.selectOne) {
+      return this.prompts.selectOne(
+        `"${name}" matches more than one entry. Which do you want to install?`,
+        unique.map((entry) => ({
+          label: `${entry.kind} · ${entry.adapter}`,
+          description: entry.relativePath,
+          value: entry,
+        })),
+      );
+    }
+
+    throw new AgentPmError(
+      `"${name}" matches more than one installable entry:\n${listing}\n\n` +
+        'Narrow it with --kind <skill|agent|subagent|plugin> and/or --target <codex|claude|generic>.',
+    );
   }
 
   async previewUpdates(options: UpdateOptions = {}): Promise<UpdatePreview[]> {
@@ -2933,7 +3021,17 @@ export class AgentPmService {
     report: InspectionReport,
   ): CatalogEntryRecord[] {
     return listInstallableEntries(report).map((entry) => ({
-      id: makeId('cat', sourceId, entry.name, entry.relativePath),
+      // Include adapter and kind so a plugin carrying both a Claude and a Codex
+      // manifest (same name and path, different agent) produces two distinct
+      // catalog rows instead of colliding on the primary key.
+      id: makeId(
+        'cat',
+        sourceId,
+        entry.name,
+        entry.relativePath,
+        entry.adapter,
+        entry.kind,
+      ),
       sourceId,
       name: entry.name,
       description: null,
@@ -2942,10 +3040,23 @@ export class AgentPmService {
       path: entry.relativePath,
       adapterHint: entry.adapter,
       tags: [entry.adapter, entry.kind],
-      metadata: {},
+      metadata: { kind: entry.kind },
       createdAt: nowIso(),
       updatedAt: nowIso(),
     }));
+  }
+
+  private catalogEntryKind(entry: CatalogEntryRecord): EntryKind | null {
+    const known: EntryKind[] = ['skill', 'agent', 'subagent', 'plugin'];
+    const isKind = (value: unknown): value is EntryKind =>
+      typeof value === 'string' && (known as string[]).includes(value);
+    if (isKind(entry.metadata.kind)) {
+      return entry.metadata.kind;
+    }
+    if (entry.metadata.archive === true && isKind(entry.metadata.archiveKind)) {
+      return entry.metadata.archiveKind;
+    }
+    return entry.tags.find((tag): tag is EntryKind => isKind(tag)) ?? null;
   }
 
   private annotateInspectionForRequest(
@@ -3719,6 +3830,7 @@ export class AgentPmService {
           entries,
           requestedNames,
           options.target,
+          options.kind,
         );
       }
 
@@ -3863,37 +3975,20 @@ export class AgentPmService {
         .filter(
           (entry) =>
             matchesCatalogEntrySelector(entry, requestedName) &&
-            matchesCatalogEntryTarget(entry, options.target),
+            matchesCatalogEntryTarget(entry, options.target) &&
+            (!options.kind || this.catalogEntryKind(entry) === options.kind),
         );
       if (matches.length === 0) {
         const targetSummary = options.target
           ? ` for target "${options.target}"`
           : '';
+        const kindSummary = options.kind ? ` of kind "${options.kind}"` : '';
         throw new AgentPmError(
-          `No catalog entry named "${requestedName}"${targetSummary} found.`,
+          `No catalog entry named "${requestedName}"${targetSummary}${kindSummary} found.`,
         );
       }
 
-      let entry = matches[0]!;
-      if (matches.length > 1) {
-        if (!this.prompts.selectOne) {
-          throw new AgentPmError(
-            `Multiple catalog entries named "${requestedName}" found. Re-run interactively.`,
-          );
-        }
-        entry = await this.prompts.selectOne(
-          `Choose which "${requestedName}" entry to install:`,
-          matches.map((candidate) => {
-            const source = this.db.getSource(candidate.sourceId);
-            return {
-              label: `${candidate.name} (${source?.displayName ?? candidate.sourceId})`,
-              description: candidate.repo,
-              value: candidate,
-            };
-          }),
-        );
-      }
-
+      const entry = await this.chooseCatalogEntry(requestedName, matches, options);
       const source = this.db.getSource(entry.sourceId);
       if (!source) {
         throw new AgentPmError(
@@ -3906,50 +4001,82 @@ export class AgentPmService {
     return selections;
   }
 
+  // Choose one catalog entry when a name resolves to several. Distinct entries
+  // that differ by kind or agent get an interactive picker (labeled by kind and
+  // agent) or, non-interactively, a clear error naming the --kind/--target
+  // filters. Entries that are the same target across sources keep the first.
+  private async chooseCatalogEntry(
+    requestedName: string,
+    matches: CatalogEntryRecord[],
+    options: InstallOptions,
+  ): Promise<CatalogEntryRecord> {
+    if (matches.length === 1) {
+      return matches[0]!;
+    }
+
+    const describe = (entry: CatalogEntryRecord): string => {
+      const kind = this.catalogEntryKind(entry) ?? 'entry';
+      const agent = entry.adapterHint ?? 'unknown';
+      return `${kind} · ${agent}`;
+    };
+
+    if (!options.yes && this.prompts.selectOne) {
+      return this.prompts.selectOne(
+        `"${requestedName}" matches more than one entry. Which do you want to install?`,
+        matches.map((candidate) => {
+          const source = this.db.getSource(candidate.sourceId);
+          return {
+            label: `${candidate.name} · ${describe(candidate)}`,
+            description: source
+              ? `${source.displayName} · ${candidate.path ?? candidate.repo}`
+              : (candidate.path ?? candidate.repo),
+            value: candidate,
+          };
+        }),
+      );
+    }
+
+    const listing = matches
+      .map((candidate) => {
+        const source = this.db.getSource(candidate.sourceId);
+        return `  - ${describe(candidate)}${source ? ` in ${source.displayName}` : ''} (${candidate.path ?? candidate.repo})`;
+      })
+      .join('\n');
+    throw new AgentPmError(
+      `"${requestedName}" matches more than one installable entry:\n${listing}\n\n` +
+        'Narrow it with --kind <skill|agent|subagent|plugin> and/or --target <codex|claude|generic>.',
+    );
+  }
+
   private async resolveNamedSelectionsFromSource(
     source: SourceRecord,
     entries: CatalogEntryRecord[],
     selectors: string[],
     target?: AdapterId,
+    kind?: EntryKind,
   ): Promise<Array<{ source: SourceRecord; entry: CatalogEntryRecord }>> {
     const selections: Array<{
       source: SourceRecord;
       entry: CatalogEntryRecord;
     }> = [];
     for (const selector of selectors) {
-      const matches = entries.filter((entry) =>
-        matchesCatalogEntrySelector(entry, selector),
+      const matches = entries.filter(
+        (entry) =>
+          matchesCatalogEntrySelector(entry, selector) &&
+          (!kind || this.catalogEntryKind(entry) === kind),
       );
       if (matches.length === 0) {
         const targetSummary = target ? ` for target "${target}"` : '';
+        const kindSummary = kind ? ` of kind "${kind}"` : '';
         throw new AgentPmError(
-          `No catalog entry named "${selector}"${targetSummary} found in source ${source.displayName}.`,
+          `No catalog entry named "${selector}"${targetSummary}${kindSummary} found in source ${source.displayName}.`,
         );
       }
 
-      let entry = matches[0]!;
-      if (matches.length > 1) {
-        if (!this.prompts.selectOne) {
-          const available = matches
-            .map(
-              (candidate) =>
-                `  - ${candidate.name} (${candidate.path ?? candidate.repo})`,
-            )
-            .join('\n');
-          throw new AgentPmError(
-            `Multiple entries named "${selector}" were found in source ${source.displayName}. Re-run interactively or use a more specific path selector.\n\nMatches:\n${available}`,
-          );
-        }
-        entry = await this.prompts.selectOne(
-          `Choose which "${selector}" entry to install from ${source.displayName}:`,
-          matches.map((candidate) => ({
-            label: candidate.name,
-            description: `${candidate.adapterHint ?? 'unknown'}  ${candidate.path ?? candidate.repo}`,
-            value: candidate,
-          })),
-        );
-      }
-
+      const entry = await this.chooseCatalogEntry(selector, matches, {
+        target,
+        kind,
+      });
       selections.push({ source, entry });
     }
 

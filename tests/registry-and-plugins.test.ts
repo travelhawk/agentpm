@@ -577,3 +577,132 @@ describe('claude code plugins', () => {
     CI_TEST_TIMEOUT,
   );
 });
+
+describe('install disambiguation on identical names', () => {
+  async function nameClashRepo(): Promise<string> {
+    const repoDir = await makeTempDir('agentpm-nameclash-repo-');
+    await copyDir(path.resolve('tests/fixtures/repos/name-clash'), repoDir);
+    initFixtureGitRepo(repoDir);
+    return repoDir;
+  }
+
+  test(
+    'a skill and a plugin with the same name error without a picker',
+    async () => {
+      const homeDir = await makeTempDir('agentpm-home-');
+      const projectDir = await makeTempDir('agentpm-nameclash-project-');
+      const repoDir = await nameClashRepo();
+      const service = new AgentPmService({
+        cwd: projectDir,
+        env: { AGENTPM_HOME: homeDir },
+      });
+      try {
+        await service.addSource(repoDir);
+        await expect(
+          service.install(['widget'], {
+            scope: 'project',
+            target: 'claude',
+            yes: true,
+            updateProjectConfig: false,
+          }),
+        ).rejects.toThrow(/matches more than one/i);
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    '--kind selects the plugin, and --kind selects the skill',
+    async () => {
+      const homeDir = await makeTempDir('agentpm-home-');
+      const projectDir = await makeTempDir('agentpm-nameclash-project-');
+      const repoDir = await nameClashRepo();
+      const service = new AgentPmService({
+        cwd: projectDir,
+        env: { AGENTPM_HOME: homeDir },
+      });
+      try {
+        await service.addSource(repoDir);
+
+        const asPlugin = await service.install(['widget'], {
+          scope: 'project',
+          target: 'claude',
+          kind: 'plugin',
+          yes: true,
+          updateProjectConfig: false,
+        });
+        expect(asPlugin).toHaveLength(1);
+        expect(asPlugin[0]!.targetPath).toBe(
+          path.join(
+            projectDir,
+            '.agentpm',
+            'plugins',
+            'claude',
+            'plugins',
+            'widget',
+          ),
+        );
+
+        const asSkill = await service.install(['widget'], {
+          scope: 'project',
+          target: 'claude',
+          kind: 'skill',
+          yes: true,
+          updateProjectConfig: false,
+        });
+        expect(asSkill).toHaveLength(1);
+        expect(asSkill[0]!.targetPath).toBe(
+          path.join(projectDir, '.claude', 'skills', 'widget'),
+        );
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'an interactive picker resolves the ambiguity',
+    async () => {
+      const homeDir = await makeTempDir('agentpm-home-');
+      const projectDir = await makeTempDir('agentpm-nameclash-project-');
+      const repoDir = await nameClashRepo();
+      const picked: string[] = [];
+      const service = new AgentPmService({
+        cwd: projectDir,
+        env: { AGENTPM_HOME: homeDir },
+        prompts: {
+          selectOne<T>(
+            _message: string,
+            options: Array<{ label: string; value: T }>,
+          ): Promise<T> {
+            // Choose the plugin entry.
+            const plugin =
+              options.find((option) => /plugin/i.test(option.label)) ??
+              options[0]!;
+            picked.push(plugin.label);
+            return Promise.resolve(plugin.value);
+          },
+        },
+      });
+      try {
+        await service.addSource(repoDir);
+        const installs = await service.install(['widget'], {
+          scope: 'project',
+          target: 'claude',
+          updateProjectConfig: false,
+        });
+        expect(installs).toHaveLength(1);
+        expect(installs[0]!.targetPath).toContain(
+          path.join('.agentpm', 'plugins', 'claude', 'plugins', 'widget'),
+        );
+        expect(picked.some((label) => /plugin/i.test(label))).toBe(true);
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+});

@@ -233,6 +233,11 @@ function errorGuidance(message: string): string[] {
       'Log in first with `agentpm registry login <url> --token <token>` (or --username/--password), or pass --registry <url> non-interactively.',
     );
   }
+  if (/matches more than one|Multiple (catalog )?entries/i.test(message)) {
+    hints.push(
+      'Narrow the match with `--kind <skill|agent|subagent|plugin>` and/or `--target <codex|claude|generic>`, or run interactively to pick from a list.',
+    );
+  }
   if (hints.length === 0) {
     hints.push(
       'Run `agentpm doctor` for environment checks and `agentpm --help` for command examples.',
@@ -329,6 +334,22 @@ function resolveTarget(value?: string): InstallOptions['target'] {
     return normalized;
   }
   throw new Error('--target must be one of: codex, claude, generic');
+}
+
+function resolveKind(value?: string): InstallOptions['kind'] {
+  if (!value) {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === 'skill' ||
+    normalized === 'agent' ||
+    normalized === 'subagent' ||
+    normalized === 'plugin'
+  ) {
+    return normalized;
+  }
+  throw new Error('--kind must be one of: skill, agent, subagent, plugin');
 }
 
 function printInspection(
@@ -1402,6 +1423,10 @@ addExamples(
       '--target <target>',
       'Install only entries for codex, claude, or generic',
     )
+    .option(
+      '--kind <kind>',
+      'Install only entries of this kind: skill, agent, subagent, or plugin',
+    )
     .option('--yes', 'Accept safe install prompts automatically')
     .option('--json', 'Print machine-readable JSON')
     .action(
@@ -1417,6 +1442,7 @@ addExamples(
           skill?: string[];
           ref?: string;
           target?: string;
+          kind?: string;
           yes?: boolean;
           json?: boolean;
         },
@@ -1429,6 +1455,7 @@ addExamples(
             skills: flags.skill,
             ref: flags.ref ?? null,
             target: resolveTarget(flags.target),
+            kind: resolveKind(flags.kind),
             from: flags.from,
             addSource: flags.addSource,
             yes: flags.yes,
@@ -2380,6 +2407,7 @@ support --json for machine-readable output, and commands that prompt accept
 - agentpm source add <owner/repo | registry:URL | ./path> --json
 - agentpm source skills <source> --json         # list installable entries
 - agentpm install <name> --target claude --project --yes --json
+- agentpm install <name> --kind plugin|skill   # disambiguate a shared name
 - agentpm list --json                           # installed state
 - agentpm update --yes --json                   # preview and apply updates
 - agentpm remove <name> --json

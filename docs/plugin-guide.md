@@ -23,6 +23,19 @@ so you can install it for Claude Code and Codex independently. Plugin entries
 use the `plugin` kind; the entry's agent (`claude`/`codex`) is chosen with
 `--target`.
 
+### Name clashes with a skill
+
+A repo can contain a skill and a plugin (or two entries for different agents)
+that share a name. `agentpm install <name>` then resolves to more than one
+entry: interactively it shows a picker labeled by kind and agent; non-interactively
+it fails with a clear error. Disambiguate with `--kind <skill|agent|subagent|plugin>`
+and/or `--target <codex|claude|generic>`:
+
+```bash
+agentpm install widget --kind plugin --target claude
+agentpm install widget --kind skill
+```
+
 ## Installation model
 
 `agentpm install <plugin> --target claude|codex` places the plugin at
