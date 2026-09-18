@@ -63,6 +63,7 @@ describe('git runner', () => {
     expect(call?.[0]).toBe('git');
     expect(call?.[1]).toEqual([
       'ls-remote',
+      '--',
       'git@github.com:owner/private.git',
       'HEAD',
     ]);
@@ -71,5 +72,18 @@ describe('git runner', () => {
       windowsHide: false,
     });
     expect(call?.[2]?.env?.GIT_SSH_COMMAND).toBe('ssh');
+  });
+
+  test('rejects locators and refs that git would parse as options', async () => {
+    mockSpawnSuccess('abc123\tHEAD\n');
+
+    await expect(
+      resolveGitRevision('--upload-pack=touch /tmp/pwned', 'HEAD'),
+    ).rejects.toThrow(/starts with "-"/);
+    await expect(
+      resolveGitRevision('git@github.com:owner/private.git', '--exec=evil'),
+    ).rejects.toThrow(/starts with "-"/);
+
+    expect(vi.mocked(spawn)).not.toHaveBeenCalled();
   });
 });

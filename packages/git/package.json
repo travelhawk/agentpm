@@ -13,6 +13,6 @@
   "dependencies": {
     "@agentpm/fs": "workspace:*",
     "@agentpm/shared": "workspace:*",
-    "simple-git": "^3.28.0"
+    "simple-git": "^3.36.0"
   }
 }
