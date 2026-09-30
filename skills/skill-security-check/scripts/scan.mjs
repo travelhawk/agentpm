@@ -3003,6 +3003,31 @@ function analyseUrls(ctx, policy) {
   // reads like an e-mail but is a clone URL. Neither is ever documentation.
   const isRemoteTarget = (h) =>
     h.kind === 'ip-port' || /^git@/i.test(h.value) || /\.git$/i.test(h.value);
+  // A URL with an unresolved <placeholder> segment is a template, not a
+  // reachable address: `https://host/<owner>/<repo>/<branch>/x.png` shows a
+  // person how to build a link, and nothing can fetch it as written. The URL
+  // extractor stops at the first `<`, so the placeholder shows up in the line
+  // as the URL immediately followed by a `<name>` token. A real URL never
+  // contains a bare `<`, so this cannot hide a live fetch.
+  const isTemplate = (h) => {
+    if (h.kind === 'email') return false;
+    if (/[<>]/.test(h.value)) return true;
+    const l = h.line || '';
+    const i = l.indexOf(h.value);
+    return i >= 0 && /^<[A-Za-z][\w.-]*>/.test(l.slice(i + h.value.length));
+  };
+  // A header-only request reads the status line and never the body, so a
+  // mutable host cannot hand it code: `curl -I`, `curl -sI`, `--head`,
+  // `wget --spider`. It is still a fetch of a volatile host, so it lands on
+  // REVIEW rather than passing silently.
+  const isHeaderOnly = (h) => {
+    const l = h.line || '';
+    return (
+      /\bcurl\b[^\n|]*\s-[a-zA-Z]*I\b/.test(l) ||
+      /\b(?:curl|wget)\b[^\n|]*\s--head\b/i.test(l) ||
+      /\bwget\b[^\n|]*\s--spider\b/i.test(l)
+    );
+  };
   // What the skill does with the address itself. Attribution cannot argue with
   // any of these, so they are checked first.
   const isActedOn = (h) =>
@@ -3014,8 +3039,13 @@ function analyseUrls(ctx, policy) {
 
   // One fetch of a host taints every mention of it. Otherwise a skill could
   // fetch a domain in a script and "merely mention" it in the documentation to
-  // make the mention look harmless.
-  const acted = new Set(ctx.urlHits.filter(isActedOn).map((h) => h.host));
+  // make the mention look harmless. A template address is excluded: it cannot
+  // be fetched, so it must not taint the real mentions of the same host.
+  const acted = new Set(
+    ctx.urlHits
+      .filter((h) => isActedOn(h) && !isTemplate(h))
+      .map((h) => h.host),
+  );
 
   for (const hit of ctx.urlHits) {
     const label =
@@ -3047,14 +3077,20 @@ function analyseUrls(ctx, policy) {
       severity = REVIEW;
       rule = 'url-destination';
       note = '; the skill names it as a place to send data';
-    } else if (hostMatches(hit.host, trust.contentHosts)) {
+    } else if (hostMatches(hit.host, trust.contentHosts) && !isTemplate(hit)) {
       // A raw-content host, a paste site or a link shortener exists to hand
       // bytes to a machine. Naming one in prose is an invitation to fetch it,
       // and what comes back can be swapped after the review, so the context
       // makes no difference here.
-      severity = REJECT;
-      rule = 'url-mutable-host';
-      note = '; this host serves content that can be replaced at any time';
+      if (isHeaderOnly(hit)) {
+        severity = REVIEW;
+        rule = 'url-fetched';
+        note = '; a header-only request, so the changing content is not read';
+      } else {
+        severity = REJECT;
+        rule = 'url-mutable-host';
+        note = '; this host serves content that can be replaced at any time';
+      }
     } else if (isAttribution(hit, trust)) {
       // Attribution is checked before the taint, because the taint is only as
       // precise as a host name. A skill that fetches one github.com URL would
@@ -3065,7 +3101,11 @@ function analyseUrls(ctx, policy) {
       // The skill reaches this address, or reaches the same host elsewhere. It
       // is a real capability, and the owner of the host decides what it serves
       // tomorrow, so a person weighs it against what the skill is for.
-      if ((trust.mutablePaths ?? []).some((p) => hit.value.includes(p))) {
+      if (
+        (trust.mutablePaths ?? []).some((p) => hit.value.includes(p)) &&
+        !isTemplate(hit) &&
+        !isHeaderOnly(hit)
+      ) {
         // A moving branch ref on an ordinary host. `/blob/main/` renders a page
         // for a person to read, so it only counts once the skill fetches it.
         severity = REJECT;
