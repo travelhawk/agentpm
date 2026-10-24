@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+
 // tiny-av: the antivirus engine bundled with skill-security-check.
 //
 // It is small on purpose: a few signatures for attack tooling that has no

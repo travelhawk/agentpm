@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+
 // skill-security-check scanner: a static, offline pre-install check for agent skills.
 //
 // It reads bytes and text only. It never executes, imports or renders the
