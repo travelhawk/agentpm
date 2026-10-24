@@ -30,8 +30,10 @@ import {
   ensureDir,
   ensureManagedLink,
   isBrokenLink,
+  isWithinDirectory,
   materializeArchive,
   pathExists,
+  realpathOrNull,
   removeManagedLink,
   walkFiles,
 } from '@agentpm/fs';
@@ -811,7 +813,7 @@ export class AgentPmService {
         const targetPath = path.join(scopeRoot, mapping.targetRelativePath);
 
         await ensureDir(path.dirname(targetPath));
-        await ensureManagedLink(targetPath, linkTarget);
+        await this.relinkManagedContent(targetPath, linkTarget);
 
         const installedRevision =
           prepared.revision ??
@@ -1221,27 +1223,39 @@ export class AgentPmService {
       throw new AgentPmError(`No install named "${name}" found.`);
     }
 
-    let install = installs[0]!;
-    if (installs.length > 1) {
-      const available = this.formatRemoveCandidates(installs);
+    // Install names are only unique per scope root, so the same skill installed
+    // in two unrelated projects would otherwise make every `remove` ambiguous.
+    // Prefer the installs belonging to the workspace the command was run from;
+    // fall back to the full set when standing outside any of them, so removing
+    // another workspace's install by name still works.
+    const localInstalls = installs.filter((install) =>
+      isWithinDirectory(install.scopeRoot, this.cwd),
+    );
+    const candidates = localInstalls.length > 0 ? localInstalls : installs;
+
+    let install = candidates[0]!;
+    if (candidates.length > 1) {
+      const available = this.formatRemoveCandidates(candidates);
       const hasExplicitFilter =
         Boolean(options.adapter) ||
         Boolean(options.scope) ||
         Boolean(options.targetPath);
-      if (!this.prompts.selectOne) {
-        throw new AgentPmError(
-          `Multiple installs named "${name}" found. Re-run with --target, --scope, or --path to choose one.\n\nMatches:\n${available}`,
-        );
-      }
       if (hasExplicitFilter) {
         throw new AgentPmError(
           `Multiple installs named "${name}" still match the supplied filters. Add --path to choose one.\n\nMatches:\n${available}`,
         );
       }
+      // Without a usable picker, say what matched and which flags narrow it
+      // down, instead of letting the prompt fail with a bare "requires a TTY".
+      if (!this.prompts.selectOne || this.prompts.isInteractive?.() === false) {
+        throw new AgentPmError(
+          `Multiple installs named "${name}" found. Re-run with --target, --scope, or --path to choose one.\n\nMatches:\n${available}`,
+        );
+      }
 
       install = await this.prompts.selectOne(
         `Choose which "${name}" install to remove:`,
-        installs.map((candidate) => ({
+        candidates.map((candidate) => ({
           label: `${candidate.name} (${candidate.scope})`,
           description: candidate.targetPath,
           value: candidate,
@@ -1667,19 +1681,64 @@ export class AgentPmService {
         } satisfies PushCandidate;
       });
 
-    return [
-      ...new Map(
-        [...candidates, ...installedCandidates].map((candidate) => [
-          [
-            path.resolve(candidate.sourcePath),
-            candidate.destinationRelativePath,
-            candidate.adapter,
-            candidate.kind,
-          ].join('::'),
-          candidate,
-        ]),
-      ).values(),
-    ].sort((left, right) =>
+    // Managed library skills (e.g. from `agentpm adopt`) live under the global
+    // skill library, not the current workspace, so the scans above never see
+    // them when push runs from a project. Surface them so an adopted skill can
+    // be published to a vault from any workspace. Installs whose scopeRoot is
+    // the current root are already covered above; everything else that points
+    // into the library is added here and deduped by resolved content below.
+    const libraryRoot = path.resolve(this.paths.skillsLibraryDir);
+    const isUnderLibrary = (target: string): boolean => {
+      const resolved = path.resolve(target);
+      return (
+        resolved === libraryRoot ||
+        resolved.startsWith(`${libraryRoot}${path.sep}`)
+      );
+    };
+    const managedLibraryCandidates: PushCandidate[] = [];
+    for (const install of this.db.listInstalls()) {
+      if (
+        path.resolve(install.scopeRoot) === rootPath ||
+        !isUnderLibrary(install.linkTarget)
+      ) {
+        continue;
+      }
+      if (!(await pathExists(install.linkTarget))) {
+        continue;
+      }
+      const kind = this.inferKindFromNativePath(install.sourceRelativePath);
+      managedLibraryCandidates.push({
+        name: install.name,
+        adapter: install.adapter,
+        kind,
+        sourcePath: install.linkTarget,
+        sourceRelativePath: install.sourceRelativePath,
+        destinationRelativePath: toDestination(
+          install.name,
+          kind,
+          path.join(nativeSkillRoot(install.adapter), install.name),
+        ),
+      });
+    }
+
+    // Dedupe by resolved content + destination so a skill that appears both as
+    // an on-disk managed link and as a library install collapses to one entry.
+    // Distinct content mapping to the same destination is left intact so the
+    // collision guard can report it instead of silently dropping a variant.
+    const deduped = new Map<string, PushCandidate>();
+    for (const candidate of [
+      ...candidates,
+      ...installedCandidates,
+      ...managedLibraryCandidates,
+    ]) {
+      const identity = await this.resolveContentIdentity(candidate.sourcePath);
+      const key = [identity, candidate.destinationRelativePath].join('::');
+      if (!deduped.has(key)) {
+        deduped.set(key, candidate);
+      }
+    }
+
+    return [...deduped.values()].sort((left, right) =>
       left.destinationRelativePath.localeCompare(right.destinationRelativePath),
     );
   }
@@ -1914,9 +1973,14 @@ export class AgentPmService {
         message ??
         `Update ${entries.length === 1 ? entries[0]!.name : `${entries.length} skills`} from AgentPM`;
       this.reportStatus('Creating Git commit...');
+      // Capture stdout: with nothing staged, `git commit` still prints its
+      // "nothing to commit, working tree clean" status and exits non-zero. That
+      // is an expected outcome here (reported as a warning below), so it must
+      // not leak onto the CLI's stdout — it would corrupt `--json` output.
       await runGitCommand(['commit', '--quiet', '-m', commitMessage], {
         cwd: releasePath,
         env: this.env,
+        captureStdout: true,
       }).catch(() => {
         warnings.push('No changes to commit or commit failed.');
       });
@@ -2053,6 +2117,68 @@ export class AgentPmService {
     return 'skill';
   }
 
+  // Identify a candidate by the real content it points at, resolving symlinks.
+  // Adopted skills live in the library and are surfaced both as an on-disk
+  // managed link in the workspace and as a managed-library install; both
+  // resolve here to the same library path so they dedupe to a single entry.
+  private async resolveContentIdentity(target: string): Promise<string> {
+    try {
+      return path.resolve(await fs.realpath(target));
+    } catch {
+      return path.resolve(target);
+    }
+  }
+
+  // True when `linkPath` is already a managed symlink resolving to the given
+  // library entry. Used by pull to recognize "already installed" so it can skip
+  // re-linking instead of prompting to replace or redoing work.
+  private async isManagedLinkTo(
+    linkPath: string,
+    libraryPath: string,
+  ): Promise<boolean> {
+    const stat = await fs.lstat(linkPath).catch(() => null);
+    if (!stat?.isSymbolicLink()) {
+      return false;
+    }
+    try {
+      return (
+        path.resolve(await fs.realpath(linkPath)) ===
+        path.resolve(await fs.realpath(libraryPath))
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  // Point `linkPath` at `linkTarget`, healing a managed link whose content has
+  // moved within AgentPM-owned storage (cache container or skill library).
+  //
+  // `ensureManagedLink` deliberately refuses to overwrite a link that resolves
+  // somewhere else — that guard protects paths AgentPM did not create, and must
+  // stay. But when the stale link still resolves into our own cache or library,
+  // it is our own bookkeeping that moved, not user content: re-point it instead
+  // of failing. Without this, an install whose cache container was keyed
+  // differently by an older AgentPM version leaves `sync` permanently broken.
+  private async relinkManagedContent(
+    linkPath: string,
+    linkTarget: string,
+  ): Promise<void> {
+    const stat = await fs.lstat(linkPath).catch(() => null);
+    if (stat?.isSymbolicLink()) {
+      const current = await realpathOrNull(linkPath);
+      const next = (await realpathOrNull(linkTarget)) ?? path.resolve(linkTarget);
+      const isStaleManagedLink =
+        current === null ||
+        (current !== next &&
+          (isWithinDirectory(this.paths.cacheDir, current) ||
+            isWithinDirectory(this.paths.skillsLibraryDir, current)));
+      if (isStaleManagedLink) {
+        await removeManagedLink(linkPath);
+      }
+    }
+    await ensureManagedLink(linkPath, linkTarget);
+  }
+
   private async copyTreeInto(src: string, dest: string): Promise<void> {
     await fs.rm(dest, { recursive: true, force: true });
     const files = await walkFiles(src);
@@ -2103,6 +2229,9 @@ export class AgentPmService {
         value: adapter,
         description: nativeSkillRoot(adapter),
       })),
+      // Linking a skill into every detected agent is the natural default here,
+      // unlike push/install skill selection which opts in per entry.
+      { initialSelection: 'all' },
     );
     return selected.length > 0 ? selected : candidates;
   }
@@ -2198,7 +2327,7 @@ export class AgentPmService {
       }
 
       try {
-        await ensureManagedLink(targetPath, params.libraryPath);
+        await this.relinkManagedContent(targetPath, params.libraryPath);
       } catch (error) {
         params.warnings.push(
           `Skipped ${adapter}: ${error instanceof Error ? error.message : String(error)}`,
@@ -2304,6 +2433,8 @@ export class AgentPmService {
         sourceLocator: target.locator,
         revision,
         skills: [],
+        updated: [],
+        skipped: [],
         installs: [],
         warnings: ['No agents selected.'],
       };
@@ -2317,14 +2448,45 @@ export class AgentPmService {
 
     const installs: MaterializedSkillRecord[] = [];
     const pulledSkills: string[] = [];
+    const updatedSkills: string[] = [];
+    const skippedSkills: string[] = [];
     for (const entry of selected) {
       const libraryPath = path.join(this.paths.skillsLibraryDir, entry.name);
-      this.reportStatus(`Updating "${entry.name}" in the skill library...`);
-      await this.copyTreeInto(
-        path.join(repoPath, entry.relativePath),
-        libraryPath,
-      );
+      const sourceSkillPath = path.join(repoPath, entry.relativePath);
       pulledSkills.push(entry.name);
+
+      // Compare the incoming skill against the library copy by content
+      // signature so an unchanged skill is left untouched. When the content is
+      // identical and every chosen agent already links to this entry, there is
+      // genuinely nothing to do — skip it instead of recopying or prompting to
+      // replace.
+      const incomingSignature = await computeTreeSignature(sourceSkillPath);
+      const currentSignature = (await pathExists(libraryPath))
+        ? await computeTreeSignature(libraryPath)
+        : null;
+      const contentChanged = currentSignature !== incomingSignature;
+
+      const alreadyLinkedEverywhere = (
+        await Promise.all(
+          agents.map((adapter) =>
+            this.isManagedLinkTo(
+              path.join(scopeRoot, nativeSkillRoot(adapter), entry.name),
+              libraryPath,
+            ),
+          ),
+        )
+      ).every(Boolean);
+
+      if (!contentChanged && alreadyLinkedEverywhere) {
+        skippedSkills.push(entry.name);
+        continue;
+      }
+
+      if (contentChanged) {
+        this.reportStatus(`Updating "${entry.name}" in the skill library...`);
+        await this.copyTreeInto(sourceSkillPath, libraryPath);
+        updatedSkills.push(entry.name);
+      }
 
       const materialized = await this.linkSkillIntoAgents({
         name: entry.name,
@@ -2348,6 +2510,8 @@ export class AgentPmService {
       sourceLocator: target.locator,
       revision,
       skills: pulledSkills,
+      updated: updatedSkills,
+      skipped: skippedSkills,
       installs,
       warnings,
     };
@@ -3650,7 +3814,15 @@ export class AgentPmService {
     },
   ): Promise<PreparedContent> {
     const requestedRef = options.revision ?? options.ref ?? null;
-    const cacheKey = makeId('cache', locator, requestedRef ?? 'HEAD');
+    // Key the cache container on the locator alone. Every checkout already lives
+    // in a per-revision directory (`<base>/r/<revision>`), so folding the
+    // *requested* ref into the key only splits one repository across several
+    // containers: an unpinned install resolves under "HEAD" while a later `sync`
+    // — which passes the revision that install pinned into agentpm.yaml —
+    // resolves the identical commit under a second container. The managed link
+    // then points into the first container while sync computes the second, and
+    // relinking is refused as a different target, permanently wedging `sync`.
+    const cacheKey = makeId('cache', locator);
     const cacheBasePath = this.cacheBasePath(cacheKey);
     const existingCache = this.db.getCacheRepo(cacheKey);
     const installCount = this.db.countInstallsForCacheKey(cacheKey);

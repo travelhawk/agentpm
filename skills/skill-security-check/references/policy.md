@@ -91,7 +91,7 @@ document carries dozens and no parser fetches them.
 | `hidden-*`                                                                                      | Any network, dependency, execution or injection pattern found inside an HTML comment, invisible text or decoded data. Hidden text gets no benefit of the doubt. |
 | `bin-executable-*`, `bin-magic-mismatch`                                                        | Native executables, bytecode, shortcuts, macro documents, and files whose content does not match their extension.                                               |
 | `fs-symlink-escape`, `fs-special-file`, `fs-name-hidden-chars`                                  | Links that leave the skill, device files, and file names with invisible characters.                                                                             |
-| `av-threat`                                                                                     | A working antivirus engine detected malware.                                                                                                                    |
+| `av-threat`                                                                                     | A working antivirus engine detected malware. This includes the bundled engine, which also flags a program hidden inside a text encoding.                        |
 | `git-file-missing`                                                                              | A file is in the Git tree but not on disk, for example because the antivirus quarantined it.                                                                    |
 | `file-unreadable`                                                                               | A file could not be read.                                                                                                                                       |
 | `scan-incomplete`                                                                               | The sandboxed analysis timed out (120 s, possibly crafted input), crashed, or was blocked from reading part of the skill. The gate fails closed.                |
@@ -145,7 +145,7 @@ Capability, not malice. These are the rows the decision summary is built for.
 | `bin-opaque`, `bin-unknown`                                                                                             | Archives, PDFs and office documents whose content was not analysed.                                                                                                                                                                 |
 | `policy-override`                                                                                                       | The local trust override could not be used: unknown keys, wrong schema, a symlink, too large, or malformed JSON. Never a silent fallback.                                                                                           |
 | `unicode-*` (other), `text-*`, `md-html-comment`                                                                        | Direction marks, filler characters, homoglyph words, long lines, blank-line padding, large encoded blobs, text in HTML comments.                                                                                                    |
-| `av-none-working`                                                                                                       | The skill has scripts or binaries and no antivirus engine passed its canary test.                                                                                                                                                   |
+| `av-none-working`                                                                                                       | The skill has scripts or binaries and no antivirus engine passed its canary test, not even the bundled one. Without `--no-av` this means the bundled engine failed to start or failed its self-test.                                |
 | `no-skill-md`, `fs-*` (other)                                                                                           | Not a standard skill folder, symlinks inside the skill, unportable or colliding names, size limits.                                                                                                                                 |
 
 A REVIEW pattern that appears inside a prohibition ("never pass `--yolo`") is downgraded to INFO. REJECT rules are never downgraded.
@@ -171,7 +171,7 @@ The **content digest** is SHA-256 over sorted lines of `<sha256 of file>  <posix
 
 The report footer adds two more hashes:
 
-- **ruleset** — SHA-256 over `scan.mjs`, `remote-content.mjs`, `package-policy.mjs` and `trust-data.mjs` together. Hashing `scan.mjs` alone would let the parsers or the trust data change unnoticed.
+- **ruleset** — SHA-256 over `scan.mjs`, `remote-content.mjs`, `package-policy.mjs`, `trust-data.mjs`, `tiny-av.mjs` and `av-signatures.mjs` together. Hashing `scan.mjs` alone would let the parsers, the trust data or the antivirus signatures change unnoticed.
 - **policy** — SHA-256 over the effective trust data and the mode (`standard` or `strict`), after any local override was applied.
 
 An approval binds to all three. If the skill's bytes, the rules, or the policy change, the skill needs a new decision.

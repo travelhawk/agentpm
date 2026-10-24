@@ -5,6 +5,7 @@ import { Command } from 'commander';
 
 import {
   AgentPmService,
+  listInstallableEntries,
   publishSkillToRegistry,
   registryLogin,
   registryLogout,
@@ -208,7 +209,7 @@ function errorGuidance(message: string): string[] {
       'Use a comma-separated subset of `codex`, `claude`, or `generic` for `--target`.',
     );
   }
-  if (/skills\.sh|public skills|npx skills/i.test(message)) {
+  if (/skills\.sh|public skills/i.test(message)) {
     hints.push(
       'Verify network access and retry with `agentpm skills search <query>` before installing.',
     );
@@ -377,8 +378,13 @@ function printInspection(
     console.log(`  ${symbols.warning} no components detected`);
   }
   for (const group of report.groups) {
+    // Show the layout root: several layouts share a label ("Generic skills"
+    // matches both `.agents/skills` and `skills`), and the deep-scan fallback
+    // re-reports entries a native layout already matched. Without the root the
+    // list reads like separate skill sets rather than overlapping views.
+    const root = group.relativeRoot === '' ? '<repo root>' : group.relativeRoot;
     console.log(
-      `  ${symbols.success} ${style.green(group.label)} (${group.entries.length} entries)`,
+      `  ${symbols.success} ${style.green(group.label)} ${style.gray(`(${root})`)} - ${group.entries.length} entries`,
     );
   }
 
@@ -396,12 +402,16 @@ function printInspection(
   }
 
   section('Entries');
-  for (const group of report.groups) {
-    for (const entry of group.entries) {
-      console.log(
-        `  ${symbols.arrow} ${style.bold(entry.name)} ${style.gray('->')} ${style.underline(entry.relativePath)}`,
-      );
-    }
+  // Deduplicated the same way the install/push flows resolve entries, so the
+  // listing matches what AgentPM would actually offer to install.
+  const entries = listInstallableEntries(report);
+  if (entries.length === 0) {
+    console.log(`  ${symbols.warning} no installable entries detected`);
+  }
+  for (const entry of entries) {
+    console.log(
+      `  ${symbols.arrow} ${style.bold(entry.name)} ${style.gray('->')} ${style.underline(entry.relativePath)}`,
+    );
   }
 
   if (report.scripts.length > 0) {
@@ -853,7 +863,7 @@ const skillsCmd = addExamples(
   program
     .command('skills')
     .description(
-      'Search and import public skills through the skills.sh CLI bridge',
+      'Search and import public skills through the skills.sh bridge',
     ),
   [
     'agentpm skills search typescript',
@@ -1699,8 +1709,11 @@ addExamples(
           return;
         }
         if (result.success) {
+          // A dry run writes nothing to the target, so do not announce a push
+          // that did not happen.
+          const headline = flags.dryRun ? 'Would push to' : 'Pushed to';
           console.log(
-            `\n${symbols.success} ${style.bold('Pushed to')} ${style.cyan(result.targetLocator)}`,
+            `\n${symbols.success} ${style.bold(headline)} ${style.cyan(result.targetLocator)}`,
           );
           for (const entry of result.entries) {
             console.log(`  ${symbols.bullet} ${entry}`);
@@ -1776,6 +1789,11 @@ addExamples(
           for (const install of result.installs) {
             console.log(
               `  ${symbols.bullet} ${style.green(install.name)} ${style.gray('->')} ${install.targetPath}`,
+            );
+          }
+          if (result.skipped.length > 0) {
+            console.log(
+              `  ${symbols.bullet} ${style.gray(`Already up to date: ${result.skipped.join(', ')}`)}`,
             );
           }
           for (const warning of result.warnings) {

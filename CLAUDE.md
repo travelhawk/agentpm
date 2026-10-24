@@ -33,8 +33,8 @@ pnpm + Turborepo monorepo. The CLI is intentionally thin; nearly all behavior li
   core service. Keep command bodies thin.
 - `packages/core` — the orchestration layer. `service.ts` (`AgentPmService`) is the
   large hub that coordinates resolution, install/update/sync/push, doctor, and cache.
-  `provider-bridge.ts` is the public no-key discovery bridge that shells out to
-  `npx skills` (skills.sh) for `agentpm skills search/install/...`.
+  `provider-bridge.ts` is the public no-key discovery bridge that queries the
+  skills.sh search endpoint over HTTPS for `agentpm skills search/install/...`.
 - `packages/config` — loads/writes the optional committed `agentpm.yaml` project contract
   (and `.agentpmrc` local override). Skills can be string shorthand or detailed objects
   (`source`, `ref`, `revision`, `target`, `scope`, `items`, `workspaceRoot`). `target`

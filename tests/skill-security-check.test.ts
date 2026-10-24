@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import {
   mkdirSync,
   mkdtempSync,
@@ -8,6 +9,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { afterAll, describe, expect, it } from 'vitest';
 
 // Evaluation suite for the standalone skill-security-check scanner. Fixtures are
@@ -210,6 +212,33 @@ describe('skill-security-check scanner', () => {
     expect(fetched.result.verdict).toBe('REJECT');
   });
 
+  // A doc link on a host that some script fetches is tainted, but the link
+  // itself is still a page for a person. It needs a decision, not a block.
+  it('reviews a moving branch link whose host is only fetched elsewhere', () => {
+    const { findings, result } = scan({
+      'SKILL.md': skillMd(
+        'See the [guide](https://github.com/o/r/blob/main/docs/guide.md).',
+      ),
+      'scripts/get.sh': '#!/bin/sh\ngit clone https://github.com/o/tool.git\n',
+    });
+    const link = findings.filter((f) => f.file === 'SKILL.md');
+    expect(link.map((f) => f.rule)).toContain('url-fetched');
+    expect(findings.map((f) => f.rule)).not.toContain('url-mutable-host');
+    expect(result.verdict).toBe('REVIEW');
+  });
+
+  // A raw address pinned to a full commit SHA cannot change after the review.
+  it('reviews a raw-host URL pinned to a commit instead of rejecting it', () => {
+    const { rules, result } = scan({
+      'SKILL.md': skillMd(
+        'Sample: https://raw.githubusercontent.com/o/r/b48f83db2984bc7fa2ec7879a32d7efb1be8d333/t.md',
+      ),
+    });
+    expect(rules).not.toContain('url-mutable-host');
+    expect(rules).toContain('url-fetched');
+    expect(result.verdict).toBe('REVIEW');
+  });
+
   // Regression: a raw-host URL written as a README template. The `<owner>`
   // placeholders mean nothing can fetch it, so it must not reject (oneshot).
   it('does not reject a raw-host URL that is a <placeholder> template', () => {
@@ -396,6 +425,35 @@ describe('skill-security-check scanner', () => {
         'dep-registry-override',
       ]),
     );
+  });
+
+  it('reviews submodules instead of rejecting them', () => {
+    const { findings, result } = scan({
+      'SKILL.md': skillMd('Nothing to see.'),
+      '.gitmodules': '[submodule "x"]\n\tpath = x\n',
+    });
+    const sub = findings.find((f) => f.rule === 'dep-git-submodule');
+    expect(sub?.severity).toBe('review');
+    expect(result.verdict).toBe('REVIEW');
+  });
+
+  // An .npmrc that only tunes npm's behaviour redirects nothing.
+  it('does not treat an .npmrc with only harmless settings as an override', () => {
+    const harmless = scan({
+      'SKILL.md': skillMd('Nothing to see.'),
+      '.npmrc': '# local\nengine-strict=true\nsave-exact=true\n',
+    });
+    expect(harmless.rules).not.toContain('dep-registry-override');
+    const risky = scan({
+      'SKILL.md': skillMd('Nothing to see.'),
+      '.npmrc': 'engine-strict=true\nnode-options=--require ./x.js\n',
+    });
+    expect(risky.rules).toContain('dep-registry-override');
+    const scoped = scan({
+      'SKILL.md': skillMd('Nothing to see.'),
+      '.npmrc': '@acme:registry=https://npm.acme.example/\n',
+    });
+    expect(scoped.rules).toContain('dep-registry-override');
   });
 
   it('rejects network code without a literal URL', () => {
@@ -877,4 +935,45 @@ describe('skill-security-check scanner', () => {
     expect(rules).not.toContain('dep-name-invalid');
     expect(result.verdict).toBe('REVIEW');
   });
+
+  // These two run the antivirus step, so system engines run as well. The
+  // bundled engine is the one that must see the hidden program.
+  it('runs the bundled antivirus engine and passes a clean skill', () => {
+    const root = writeTree({
+      'SKILL.md': skillMd('Count words.'),
+      'scripts/count.py': 'import sys\nprint(len(sys.argv))\n',
+    });
+    const r = spawnSync(process.execPath, [SCANNER, root, '--json'], {
+      encoding: 'utf8',
+    });
+    const res = (JSON.parse(r.stdout) as { results: unknown[] })
+      .results[0] as SkillResult & {
+      antivirus: { engine: string; status: string }[];
+    };
+    const bundled = res.antivirus.find((e) => e.engine.startsWith('tiny-av'));
+    expect(bundled?.status).toBe('clean');
+    expect(res.findings.map((f) => f.rule)).not.toContain('av-threat');
+  }, 120000);
+
+  it('rejects a program hidden in a script through the bundled engine', () => {
+    const elf = randomBytes(4096);
+    elf.writeUInt32BE(0x7f454c46, 0);
+    const root = writeTree({
+      'SKILL.md': skillMd('Run the helper.'),
+      'scripts/helper.py': `PAYLOAD = "${gzipSync(elf).toString('base64')}"\n`,
+    });
+    const r = spawnSync(process.execPath, [SCANNER, root, '--json'], {
+      encoding: 'utf8',
+    });
+    const res = (JSON.parse(r.stdout) as { results: unknown[] })
+      .results[0] as SkillResult & {
+      antivirus: { engine: string; status: string; threats?: string[] }[];
+    };
+    const bundled = res.antivirus.find((e) => e.engine.startsWith('tiny-av'));
+    expect(bundled?.status).toBe('threat');
+    expect(bundled?.threats?.join(' ')).toContain(
+      'Dropper.EncodedExecutable in scripts/helper.py',
+    );
+    expect(res.verdict).toBe('REJECT');
+  }, 120000);
 });

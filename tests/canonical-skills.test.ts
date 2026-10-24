@@ -8,7 +8,11 @@ import { AgentPmService } from '@agentpm/core';
 
 import { git, makeTempDir, writeFile } from './helpers';
 
-const CI_TEST_TIMEOUT = process.env.CI ? 30_000 : 15_000;
+// Tests here shell out to the CLI (often twice, through tsx with its cache
+// disabled), so a single case can legitimately take well over ten seconds on a
+// busy machine. Use the same budget locally as on CI: the tighter local limit
+// only produced timeout flakes, never a faster signal.
+const CI_TEST_TIMEOUT = 30_000;
 
 const GIT_ENV = {
   GIT_AUTHOR_NAME: 'AgentPM Tests',
@@ -186,6 +190,107 @@ describe('canonical skill library', () => {
         expect(stats.isSymbolicLink()).toBe(true);
         expect(await realpath(link)).toBe(await realpath(libraryEntry));
       }
+    } finally {
+      service.close();
+    }
+  }, CI_TEST_TIMEOUT);
+
+  test('push surfaces a managed library skill from a workspace where it is not installed', async () => {
+    const homeDir = await makeTempDir('agentpm-canon-home-');
+    const envDir = await makeTempDir('agentpm-canon-env-');
+    const projectDir = await makeTempDir('agentpm-canon-project-');
+    const remoteDir = await makeTempDir('agentpm-canon-remote-');
+    const remoteRepo = path.join(remoteDir, 'skills.git');
+    const verifyDir = path.join(remoteDir, 'verify');
+
+    git(remoteDir, 'init', '--bare', remoteRepo);
+
+    // Adopt a skill in one environment so it lands in the shared library.
+    const originPath = path.join(envDir, '.claude', 'skills', 'helper');
+    await writeFile(path.join(originPath, 'SKILL.md'), '# helper skill\n');
+    const adoptService = new AgentPmService({
+      cwd: envDir,
+      env: { ...GIT_ENV, AGENTPM_HOME: homeDir },
+    });
+    try {
+      await adoptService.adopt(originPath, { yes: true });
+    } finally {
+      adoptService.close();
+    }
+
+    // Push from an unrelated, empty project. The skill lives only in the
+    // library, yet it must still be selectable and pushable by name.
+    const pushService = new AgentPmService({
+      cwd: projectDir,
+      env: { ...GIT_ENV, AGENTPM_HOME: homeDir },
+    });
+    try {
+      const result = await pushService.push({
+        target: remoteRepo,
+        path: 'helper',
+        message: 'push adopted skill',
+      });
+      expect(result.entries).toEqual(['skills/helper']);
+
+      git(remoteDir, 'clone', remoteRepo, verifyDir);
+      expect(
+        await fs.readFile(
+          path.join(verifyDir, 'skills', 'helper', 'SKILL.md'),
+          'utf8',
+        ),
+      ).toContain('# helper skill');
+    } finally {
+      pushService.close();
+    }
+  }, CI_TEST_TIMEOUT);
+
+  test('pull skips skills that are already up to date instead of recopying them', async () => {
+    const homeDir = await makeTempDir('agentpm-canon-home-');
+    const projectDir = await makeTempDir('agentpm-canon-project-');
+    const remoteDir = await makeTempDir('agentpm-canon-remote-');
+    const remoteRepo = path.join(remoteDir, 'skills.git');
+    const seedDir = path.join(remoteDir, 'seed');
+
+    git(remoteDir, 'init', '--bare', '-b', 'main', remoteRepo);
+    await writeFile(
+      path.join(seedDir, 'skills', 'demo', 'SKILL.md'),
+      '# demo skill\n',
+    );
+    git(seedDir, 'init', '-b', 'main');
+    git(seedDir, 'config', 'user.name', 'AgentPM Tests');
+    git(seedDir, 'config', 'user.email', 'tests@example.com');
+    git(seedDir, 'add', '.');
+    git(seedDir, 'commit', '-m', 'seed');
+    git(seedDir, 'remote', 'add', 'origin', remoteRepo);
+    git(seedDir, 'push', 'origin', 'main');
+
+    const service = new AgentPmService({
+      cwd: projectDir,
+      env: { ...GIT_ENV, AGENTPM_HOME: homeDir },
+    });
+    try {
+      const first = await service.pull({
+        target: remoteRepo,
+        agents: ['codex', 'claude'],
+        scope: 'project',
+        yes: true,
+      });
+      expect(first.updated).toEqual(['demo']);
+      expect(first.skipped).toEqual([]);
+      expect(first.installs).toHaveLength(2);
+
+      // Pulling the same version again should be a no-op: the skill is reported
+      // as skipped, nothing is re-linked, and the library is left untouched.
+      const second = await service.pull({
+        target: remoteRepo,
+        agents: ['codex', 'claude'],
+        scope: 'project',
+        yes: true,
+      });
+      expect(second.skills).toEqual(['demo']);
+      expect(second.updated).toEqual([]);
+      expect(second.skipped).toEqual(['demo']);
+      expect(second.installs).toHaveLength(0);
     } finally {
       service.close();
     }

@@ -3,7 +3,8 @@
 //
 // It reads bytes and text only. It never executes, imports or renders the
 // scanned content and never opens a network connection. The only child
-// processes are local antivirus engines and `git ls-tree` on a checkout.
+// processes are local antivirus engines, the bundled engine (tiny-av.mjs)
+// and `git ls-tree` on a checkout.
 //
 // Usage: node scan.mjs <path> [--json] [--summary] [--single] [--no-av]
 //                             [--no-sandbox] [--strict] [--trust <file>] [--no-trust]
@@ -2156,10 +2157,12 @@ function checkManifest(base, ext, text, file, ctx) {
       REVIEW,
       `Lockfile ${base} carries no artifact hashes, so it cannot pin content`,
     );
+  // The tree pins every submodule to a commit, so its content cannot move
+  // under the review. It was not scanned either, so a person decides.
   if (lower === '.gitmodules')
     add(
-      REJECT,
-      'Git submodules pull code from other repositories',
+      REVIEW,
+      'Git submodules pull code from other repositories (pinned to a commit, not scanned)',
       'dep-git-submodule',
     );
   if (
@@ -2476,10 +2479,11 @@ function checkGitTree(root, findings) {
     if (m[1] === '160000')
       findings.add({
         rule: 'dep-git-submodule',
-        severity: REJECT,
+        severity: REVIEW,
         category: 'dependency',
         file: m[3],
-        message: 'Git submodule: code comes from another repository',
+        message:
+          'Git submodule: code comes from another repository (pinned to a commit, not scanned)',
       });
     if (m[1] === '120000') {
       const t = spawnSync(
@@ -2639,6 +2643,21 @@ function runDefender(root) {
   );
   const engine = 'Microsoft Defender';
   if (r.status === 0) return { engine, status: 'clean' };
+  // Turned off because another antivirus product is registered: not a fault.
+  // MpCmdRun only says so in its log, so read the entry of the run that just
+  // ended. Stripping NULs reads both the ANSI and the UTF-16 log format.
+  let log = '';
+  try {
+    const all = fs
+      .readFileSync(path.join(os.tmpdir(), 'MpCmdRun.log'))
+      .toString('latin1')
+      .replace(/\0/g, '');
+    log = all.slice(all.lastIndexOf('MpCmdRun: Command Line:'));
+  } catch {
+    /* no log: judge by the output alone */
+  }
+  if (/Product\/Feature disabled|0x800106ba/i.test(`${out}\n${log}`))
+    return { engine, status: 'off', detail: 'turned off on this machine' };
   // Exit code 2 means "threats found" but is also used for failures, so require a parsed threat.
   if (threats.length) return { engine, status: 'threat', threats, files };
   return {
@@ -2658,6 +2677,15 @@ function runAmsi(root, entries) {
     path.dirname(fileURLToPath(import.meta.url)),
     'amsi-scan.ps1',
   );
+  // Some products read a script that loads amsi.dll as an AMSI bypass and
+  // quarantine it. Say so instead of reporting a bare PowerShell error.
+  if (!fs.existsSync(script))
+    return {
+      engine: 'AMSI (registered antivirus)',
+      status: 'unavailable',
+      detail:
+        'scripts/amsi-scan.ps1 is missing; an antivirus may have quarantined it. Restore it and add an exception for this skill folder',
+    };
   const files = entries
     .filter((e) => e.type === 'file' && (e.size ?? 0) < 64 * 1024 * 1024)
     .map((e) => e.abs);
@@ -2681,7 +2709,7 @@ function runAmsi(root, entries) {
       maxBuffer: 64 * 1024 * 1024,
     },
   );
-  const engine = 'AMSI (registered antivirus)';
+  let engine = 'AMSI (registered antivirus)';
   if (r.error || r.status !== 0)
     return {
       engine,
@@ -2697,6 +2725,8 @@ function runAmsi(root, entries) {
     .filter((l) => l.startsWith('{'))
     .map((l) => JSON.parse(l));
   const canary = rows.find((x) => x.canary);
+  if (canary?.products?.length)
+    engine = `AMSI (${canary.products.map((p) => sanitize(p, 60)).join(', ')})`;
   const hits = rows.filter((x) => !x.canary && x.detected);
   const errors = rows.filter((x) => !x.canary && x.error);
   if (hits.length)
@@ -2766,8 +2796,77 @@ function runClam(root) {
   return null;
 }
 
-function runAntivirus(root, entries) {
-  const engines = [];
+// The engine bundled with this skill (tiny-av.mjs). It runs everywhere, under
+// the same read-only sandbox as the static analysis.
+function runBundled(root, entries, useSandbox) {
+  const engine = 'tiny-av (bundled)';
+  const sandbox = useSandbox ? sandboxFlags(root) : null;
+  const r = spawnSync(
+    process.execPath,
+    [...(sandbox?.args ?? []), path.join(SCRIPT_DIR, 'tiny-av.mjs'), '--stdin'],
+    {
+      input: entries
+        .filter((e) => e.type === 'file')
+        .map((e) => e.abs)
+        .join('\n'),
+      encoding: 'utf8',
+      timeout: STATIC_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+      windowsHide: true,
+    },
+  );
+  let out;
+  try {
+    out = JSON.parse(r.stdout);
+  } catch {
+    return {
+      engine,
+      bundled: true,
+      status: 'unavailable',
+      detail: sanitize(
+        r.error?.code === 'ETIMEDOUT'
+          ? 'did not finish in time'
+          : (r.stderr ?? '').trim().split('\n').pop() || `exit ${r.status}`,
+        200,
+      ),
+    };
+  }
+  const label = `tiny-av ${out.version} (bundled, ${out.signatures} signatures)`;
+  if (!out.selfTest.ok)
+    return {
+      engine: label,
+      bundled: true,
+      status: 'unverified',
+      detail: `self-test failed: ${out.selfTest.failed.join(', ')}`,
+    };
+  const rel = (f) => path.relative(root, f).split(path.sep).join('/');
+  if (out.threats.length)
+    return {
+      engine: label,
+      bundled: true,
+      status: 'threat',
+      threats: [
+        ...new Set(
+          out.threats.map(
+            (t) =>
+              `${t.name} in ${rel(t.file)}${t.where.length ? ` (${t.where.map((w) => sanitize(w, 60)).join(' > ')})` : ''}`,
+          ),
+        ),
+      ],
+      files: [...new Set(out.threats.map((t) => rel(t.file)))],
+    };
+  if (out.errors.length)
+    return {
+      engine: label,
+      bundled: true,
+      status: 'unavailable',
+      detail: `${out.errors.length} file(s) could not be scanned`,
+    };
+  return { engine: label, bundled: true, status: 'clean' };
+}
+
+function runAntivirus(root, entries, useSandbox) {
+  const engines = [runBundled(root, entries, useSandbox)];
   const defender = runDefender(root);
   if (defender) engines.push(defender);
   if (!defender || !['clean', 'threat'].includes(defender.status)) {
@@ -2793,6 +2892,7 @@ function applyAntivirus(av, findings, needsAv) {
   const working = av.filter(
     (e) => e.status === 'clean' || e.status === 'threat',
   );
+  const systemWorking = working.filter((e) => !e.bundled);
   for (const e of av) {
     if (e.status === 'threat') {
       findings.add({
@@ -2803,6 +2903,9 @@ function applyAntivirus(av, findings, needsAv) {
         message: `${e.engine} detected: ${(e.threats ?? []).join('; ') || 'threat'}`,
         evidence: (e.files ?? []).join(', '),
       });
+    } else if (e.status === 'off' && working.length) {
+      // A product that is switched off while another one scanned is no news.
+      continue;
     } else if (e.status !== 'clean') {
       findings.add({
         rule: `av-${e.status}`,
@@ -2812,6 +2915,16 @@ function applyAntivirus(av, findings, needsAv) {
         message: `${e.engine} ${e.status}: ${e.detail}`,
       });
     }
+  }
+  if (working.length && !systemWorking.length) {
+    findings.add({
+      rule: 'av-bundled-only',
+      severity: INFO,
+      category: 'antivirus',
+      file: '.',
+      message:
+        'Only the bundled engine scanned the files. It knows a small set of attack-tool signatures, not current malware; install ClamAV or enable an AMSI-capable antivirus for a full scan',
+    });
   }
   if (!working.length) {
     findings.add({
@@ -3028,6 +3141,17 @@ function analyseUrls(ctx, policy) {
       /\bwget\b[^\n|]*\s--spider\b/i.test(l)
     );
   };
+  // A raw address pinned to a full commit SHA always serves the same bytes, so
+  // nothing can be swapped after the review. Nobody scanned those bytes either,
+  // so it lands on REVIEW rather than passing. A tag or branch name can move,
+  // which is why only a 40-hex commit counts.
+  const isCommitPinned = (h) =>
+    /^https?:\/\/raw\.githubusercontent\.com\/[^/]+\/[^/]+\/[0-9a-f]{40}\//i.test(
+      h.value,
+    ) ||
+    /^https?:\/\/gist\.githubusercontent\.com\/[^/]+\/[0-9a-f]+\/raw\/[0-9a-f]{40}\//i.test(
+      h.value,
+    );
   // What the skill does with the address itself. Attribution cannot argue with
   // any of these, so they are checked first.
   const isActedOn = (h) =>
@@ -3086,6 +3210,11 @@ function analyseUrls(ctx, policy) {
         severity = REVIEW;
         rule = 'url-fetched';
         note = '; a header-only request, so the changing content is not read';
+      } else if (isCommitPinned(hit)) {
+        severity = REVIEW;
+        rule = 'url-fetched';
+        note =
+          '; pinned to a commit, so the content cannot change, but it was not scanned';
       } else {
         severity = REJECT;
         rule = 'url-mutable-host';
@@ -3101,16 +3230,24 @@ function analyseUrls(ctx, policy) {
       // The skill reaches this address, or reaches the same host elsewhere. It
       // is a real capability, and the owner of the host decides what it serves
       // tomorrow, so a person weighs it against what the skill is for.
-      if (
+      const movingRef =
         (trust.mutablePaths ?? []).some((p) => hit.value.includes(p)) &&
         !isTemplate(hit) &&
-        !isHeaderOnly(hit)
-      ) {
+        !isHeaderOnly(hit);
+      if (movingRef && (actedOn || isRemoteTarget(hit))) {
         // A moving branch ref on an ordinary host. `/blob/main/` renders a page
         // for a person to read, so it only counts once the skill fetches it.
         severity = REJECT;
         rule = 'url-mutable-host';
         note = '; this address follows a branch, so its content can change';
+      } else if (movingRef) {
+        // Only the host is fetched elsewhere; this address itself is a link a
+        // person follows. The taint still makes it a decision, not a block,
+        // or every doc link in a skill that runs one `git clone` would reject.
+        severity = REVIEW;
+        rule = 'url-fetched';
+        note =
+          '; the same host is fetched elsewhere in this skill, and this address follows a branch';
       } else {
         severity = REVIEW;
         rule = 'url-fetched';
@@ -3514,7 +3651,9 @@ function scanSkill(root, options) {
     abs: path.join(root, f.rel),
     size: f.size,
   }));
-  const av = options.av ? runAntivirus(root, entries) : 'skipped';
+  const av = options.av
+    ? runAntivirus(root, entries, options.sandbox)
+    : 'skipped';
   applyAntivirus(
     av,
     extra,
@@ -3838,13 +3977,16 @@ function renderSummary(results) {
   return out.join('\n');
 }
 
-// The rules live in four files now, so hashing scan.mjs alone would let the
-// policy or the parsers change without the approval hash noticing.
+// The rules live in several files, so hashing scan.mjs alone would let the
+// policy, the parsers or the antivirus signatures change without the
+// approval hash noticing.
 const RULESET_FILES = [
   'scan.mjs',
   'remote-content.mjs',
   'package-policy.mjs',
   'trust-data.mjs',
+  'tiny-av.mjs',
+  'av-signatures.mjs',
 ];
 
 let cachedSelfHash;

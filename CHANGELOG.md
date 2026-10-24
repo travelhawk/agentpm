@@ -8,6 +8,23 @@ This repo uses a simple release workflow:
 - each release-facing cycle bumps the workspace package versions together
 - changelog and version bumps should land in the same commit when practical
 
+## [0.11.0] - Unreleased
+
+### Added
+
+- `agentpm push` now surfaces **managed library skills** as push candidates. A skill brought under management with `agentpm adopt` (which lives in the canonical library, not the current workspace) can now be selected and published to a vault from any workspace — e.g. `agentpm push <skill-name>` or by ticking it in the interactive picker.
+
+### Fixed
+
+- The interactive `agentpm push` picker no longer pre-selects every skill. Previously a bare `agentpm push` opened with all entries checked, so confirming pushed everything — effectively `--all`. The picker now starts with nothing selected so you opt into each skill (press `a` to select all, `n` for none). Skill selection in the interactive install flow behaves the same way; choosing which agents to install into still defaults to all.
+- `agentpm pull` is now version-aware: a skill whose content matches the library copy and is already linked into the chosen agents is left untouched and reported as skipped, instead of being recopied or triggering a replace prompt. The CLI now reports which skills were updated versus already up to date.
+- `agentpm push` deduplicates candidates by resolved content, so a managed skill that appears both as an on-disk link and a library install no longer aborts `--all` with a canonical-destination collision.
+
+### Security
+
+- Pinned Git revisions are now verified. A remote whose default branch was named `FETCH_HEAD` could make AgentPM install the branch tip instead of the pinned commit, and cache it under the pinned SHA. AgentPM now checks out the pinned object id detached, compares `HEAD` with the pin, re-verifies cached releases before reuse, and removes the release folder on a mismatch. Locators, refs and revisions that start with `-` are rejected, and `--` is passed to `ls-remote`, `clone` and `fetch`. `simple-git` is now `^3.36.0`.
+- `agentpm skills search` and query installs no longer run `npx skills`. The bridge now calls the public skills.sh search endpoint over HTTPS. This removes an unpinned npm package that ran with the full environment (including registry tokens), and it removes the `cmd.exe` call on Windows. Results that contain control characters, or that are not `owner/repo@skill` selectors, are dropped. `AGENTPM_SKILLS_SH_URL` can point the bridge at a mirror.
+
 ## [0.10.0] - 2026-08-22
 
 ### Added
@@ -36,8 +53,8 @@ This repo uses a simple release workflow:
 
 - Added a README prompt and command recipe for AI agents to install and operate AgentPM without TTY menus, using explicit selectors, `--yes`, `--all`, and `--json`.
 - Updated quickstart command recipes so `agentpm quickstart --json` returns non-interactive, agent-safe commands.
-- Added a README prompt and command recipe for AI agents to install and operate AgentPM without TTY menus, using explicit selectors, `--yes`, `--all`, and `--json`.
-- Updated quickstart command recipes so `agentpm quickstart --json` returns non-interactive, agent-safe commands.
+
+## [0.9.1] - 2026-06-29
 
 ### Fixed
 

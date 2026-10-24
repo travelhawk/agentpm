@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -8,7 +10,7 @@ import { describe, expect, test } from 'vitest';
 
 import {
   AgentPmService,
-  parseSkillsProviderSearchOutput,
+  parseSkillsProviderSearchResponse,
   resolveProviderInstallInput,
   resolveProviderInstallRequest,
 } from '@agentpm/core';
@@ -38,7 +40,11 @@ async function writeGitGlobalIgnoreConfig(
 
 const execFileAsync = promisify(execFile);
 const cliEntry = path.resolve('apps/cli/src/index.ts');
-const CI_TEST_TIMEOUT = process.env.CI ? 30_000 : 15_000;
+// Tests here shell out to the CLI (often twice, through tsx with its cache
+// disabled), so a single case can legitimately take well over ten seconds on a
+// busy machine. Use the same budget locally as on CI: the tighter local limit
+// only produced timeout flakes, never a faster signal.
+const CI_TEST_TIMEOUT = 30_000;
 const tsxLoader = pathToFileURL(
   path.resolve('node_modules/tsx/dist/loader.mjs'),
 ).href;
@@ -50,64 +56,59 @@ const GIT_ENV = {
   GIT_COMMITTER_EMAIL: 'tests@example.com',
 };
 
-async function createFakeNpx(binRoot: string): Promise<string> {
-  const binDir = path.join(binRoot, 'fake-npx');
-  await fs.mkdir(binDir, { recursive: true });
-  await fs.writeFile(
-    path.join(binDir, 'npx.js'),
-    [
-      'const args = process.argv.slice(2);',
-      "if (args[0] !== 'skills') { console.error('unexpected command'); process.exit(1); }",
-      "if (args[1] === 'find') {",
-      "  const query = args.slice(2).join(' ');",
-      "  if (query === 'typescript') {",
-      "    console.log('Install with npx skills add <owner/repo@skill>');",
-      "    console.log('');",
-      "    console.log('wshobson/agents@typescript-advanced-types 42.7K installs');",
-      "    console.log('└ https://skills.sh/wshobson/agents/typescript-advanced-types');",
-      "    console.log('');",
-      "    console.log('github/awesome-copilot@javascript-typescript-jest 10.6K installs');",
-      "    console.log('└ https://skills.sh/github/awesome-copilot/javascript-typescript-jest');",
-      '    process.exit(0);',
-      '  }',
-      "  if (query === 'empty') {",
-      '    console.log(\'No skills found for "empty"\');',
-      '    process.exit(0);',
-      '  }',
-      "  if (query === 'broken') {",
-      "    console.log('unexpected output');",
-      '    process.exit(0);',
-      '  }',
-      "  console.error('unexpected query');",
-      '  process.exit(1);',
-      '}',
-      "console.error('unexpected subcommand');",
-      'process.exit(1);',
-    ].join('\n'),
-    'utf8',
-  );
-  await fs.writeFile(
-    path.join(binDir, 'npx.cmd'),
-    '@echo off\r\nnode "%~dp0\\npx.js" %*\r\n',
-    'utf8',
-  );
-  const posixShim = path.join(binDir, 'npx');
-  await fs.writeFile(
-    posixShim,
-    '#!/bin/sh\nexec node "$(dirname "$0")/npx.js" "$@"\n',
-    'utf8',
-  );
-  await fs.chmod(posixShim, 0o755);
-  return binDir;
-}
+const FAKE_SKILLS_SH_RESULTS = {
+  typescript: [
+    {
+      id: 'wshobson/agents/typescript-advanced-types',
+      skillId: 'typescript-advanced-types',
+      name: 'typescript-advanced-types',
+      installs: 42_700,
+      source: 'wshobson/agents',
+    },
+    {
+      id: 'github/awesome-copilot/javascript-typescript-jest',
+      skillId: 'javascript-typescript-jest',
+      name: 'javascript-typescript-jest',
+      installs: 10_600,
+      source: 'github/awesome-copilot',
+    },
+  ],
+  empty: [],
+} as const;
 
-function withPrependedPath(
-  binDir: string,
-  env: NodeJS.ProcessEnv = {},
-): NodeJS.ProcessEnv {
+async function startFakeSkillsSh(): Promise<{
+  url: string;
+  requests: string[];
+  close: () => Promise<void>;
+}> {
+  const requests: string[] = [];
+  const server = http.createServer((req, res) => {
+    requests.push(req.url ?? '');
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const query = url.searchParams.get('q') ?? '';
+    if (url.pathname !== '/api/search' || !(query in FAKE_SKILLS_SH_RESULTS)) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end('unexpected request');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        query,
+        skills:
+          FAKE_SKILLS_SH_RESULTS[query as keyof typeof FAKE_SKILLS_SH_RESULTS],
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
   return {
-    ...env,
-    PATH: `${binDir}${path.delimiter}${env.PATH ?? process.env.PATH ?? ''}`,
+    url: `http://127.0.0.1:${port}`,
+    requests,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
   };
 }
 
@@ -134,29 +135,35 @@ async function runCli(
 }
 
 describe('update and cli flows', () => {
-  test('parses skills.sh bridge output and rejects malformed results', () => {
-    const parsed = parseSkillsProviderSearchOutput(
-      [
-        'Install with npx skills add <owner/repo@skill>',
-        '',
-        'wshobson/agents@typescript-advanced-types 42.7K installs',
-        '└ https://skills.sh/wshobson/agents/typescript-advanced-types',
-      ].join('\n'),
-    );
+  test('parses skills.sh search responses and rejects malformed results', () => {
+    const parsed = parseSkillsProviderSearchResponse({
+      skills: [
+        ...FAKE_SKILLS_SH_RESULTS.typescript.slice(0, 1),
+        // Not an "owner/repo" source, so it cannot use the Git install path.
+        { id: 'x', name: 'no-repo', source: 'example.com', installs: 3 },
+        // Control characters must never reach the terminal or a selector.
+        { id: 'y', name: 'evil\x1b[2Jname', source: 'owner/repo' },
+        { id: '../z', name: 'odd-id', source: 'owner/repo', installs: 999 },
+      ],
+    });
     expect(parsed).toEqual([
       expect.objectContaining({
         skillSelector: 'wshobson/agents@typescript-advanced-types',
         source: 'wshobson/agents',
         installLocator: 'github:wshobson/agents',
         installs: '42.7K',
+        url: 'https://skills.sh/wshobson/agents/typescript-advanced-types',
+      }),
+      expect.objectContaining({
+        skillSelector: 'owner/repo@odd-id',
+        installs: '999',
+        url: null,
       }),
     ]);
-    expect(
-      parseSkillsProviderSearchOutput('No skills found for "empty"\n'),
-    ).toEqual([]);
-    expect(() =>
-      parseSkillsProviderSearchOutput('unexpected output\n'),
-    ).toThrow('skills.sh CLI returned unexpected search output');
+    expect(parseSkillsProviderSearchResponse({ skills: [] })).toEqual([]);
+    expect(() => parseSkillsProviderSearchResponse({ nope: true })).toThrow(
+      'skills.sh returned an unexpected search response',
+    );
   });
 
   test('resolves provider install requests from selectors and explicit skills', () => {
@@ -613,39 +620,65 @@ describe('update and cli flows', () => {
     async () => {
       const homeDir = await makeTempDir('agentpm-home-');
       const projectDir = await makeTempDir('agentpm-project-');
-      const binDir = await createFakeNpx(homeDir);
+      const skillsSh = await startFakeSkillsSh();
 
-      const { stdout } = await runCli(
-        ['skills', 'search', 'typescript', '--json'],
-        {
-          cwd: projectDir,
-          env: withPrependedPath(binDir, { AGENTPM_HOME: homeDir }),
-        },
-      );
+      try {
+        const { stdout } = await runCli(
+          ['skills', 'search', 'typescript', '--json'],
+          {
+            cwd: projectDir,
+            env: { AGENTPM_HOME: homeDir, AGENTPM_SKILLS_SH_URL: skillsSh.url },
+          },
+        );
 
-      const results = JSON.parse(stdout) as Array<Record<string, unknown>>;
-      expect(results[0]?.skillSelector).toBe(
-        'wshobson/agents@typescript-advanced-types',
-      );
-      expect(results[1]?.installLocator).toBe('github:github/awesome-copilot');
+        const results = JSON.parse(stdout) as Array<Record<string, unknown>>;
+        expect(results[0]?.skillSelector).toBe(
+          'wshobson/agents@typescript-advanced-types',
+        );
+        expect(results[0]?.installs).toBe('42.7K');
+        expect(results[1]?.installLocator).toBe(
+          'github:github/awesome-copilot',
+        );
+        expect(skillsSh.requests).toEqual([
+          '/api/search?q=typescript&limit=10',
+        ]);
+      } finally {
+        await skillsSh.close();
+      }
     },
     CI_TEST_TIMEOUT,
   );
 
-  test('skills search fails clearly when the provider bridge command is unavailable', async () => {
+  test('skills search fails clearly when skills.sh is unreachable or broken', async () => {
     const homeDir = await makeTempDir('agentpm-home-');
     const projectDir = await makeTempDir('agentpm-project-');
+    const skillsSh = await startFakeSkillsSh();
 
-    const service = new AgentPmService({
+    const broken = new AgentPmService({
       cwd: projectDir,
-      env: { AGENTPM_HOME: homeDir, PATH: '' },
+      env: { AGENTPM_HOME: homeDir, AGENTPM_SKILLS_SH_URL: skillsSh.url },
     });
     try {
-      await expect(service.searchProviderSkills('typescript')).rejects.toThrow(
-        'Could not run `npx skills`',
+      await expect(broken.searchProviderSkills('empty')).resolves.toEqual([]);
+      await expect(broken.searchProviderSkills('broken')).rejects.toThrow(
+        'skills.sh search failed with HTTP 500',
       );
     } finally {
-      service.close();
+      broken.close();
+      await skillsSh.close();
+    }
+
+    // The port is closed now, so the same URL is unreachable.
+    const unreachable = new AgentPmService({
+      cwd: projectDir,
+      env: { AGENTPM_HOME: homeDir, AGENTPM_SKILLS_SH_URL: skillsSh.url },
+    });
+    try {
+      await expect(
+        unreachable.searchProviderSkills('typescript'),
+      ).rejects.toThrow('Could not reach skills.sh');
+    } finally {
+      unreachable.close();
     }
   });
 

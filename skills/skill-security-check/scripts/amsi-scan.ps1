@@ -57,7 +57,15 @@ try {
             $scan = Invoke-AmsiScan ([System.Text.Encoding]::ASCII.GetBytes($sample)) 'canary'
             if ($scan.hr -eq 0 -and $scan.result -ge 32768) { $hit = $true }
         }
-        [pscustomobject]@{ canary = $true; detected = $hit } | ConvertTo-Json -Compress
+        # Name the products behind AMSI. Security Center exists on client
+        # Windows only; bits 12-15 of productState are 1 when scanning is on.
+        $products = @()
+        try {
+            $products = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop |
+                Where-Object { (($_.productState -shr 12) -band 0xF) -eq 1 } |
+                ForEach-Object { $_.displayName })
+        } catch { }
+        [pscustomobject]@{ canary = $true; detected = $hit; products = $products } | ConvertTo-Json -Compress
     }
     foreach ($file in $Files) {
         try { $bytes = [System.IO.File]::ReadAllBytes($file) } catch {

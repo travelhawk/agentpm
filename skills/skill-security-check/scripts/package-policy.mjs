@@ -317,6 +317,40 @@ export const INDEX_OVERRIDE_FILES = new Set([
   'nuget.config',
 ]);
 
+// `.npmrc` settings that change how npm resolves or reports, never where it
+// downloads from or what it runs. A file made only of these redirects nothing.
+// Anything else, including `node-options` or `script-shell`, keeps the REJECT.
+const HARMLESS_NPMRC_KEYS = new Set([
+  'engine-strict',
+  'save-exact',
+  'save-prefix',
+  'fund',
+  'audit',
+  'audit-level',
+  'package-lock',
+  'legacy-peer-deps',
+  'strict-peer-deps',
+  'strict-peer-dependencies',
+  'auto-install-peers',
+  'loglevel',
+  'progress',
+  'update-notifier',
+  'prefer-offline',
+  'ignore-scripts',
+]);
+
+function onlyHarmlessSettings(lower, text) {
+  if (lower !== '.npmrc') return false;
+  const lines = String(text ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !/^[#;]/.test(l));
+  return lines.every((l) => {
+    const m = /^([a-z-]+)\s*=\s*[\w.^~-]*$/i.exec(l);
+    return m !== null && HARMLESS_NPMRC_KEYS.has(m[1].toLowerCase());
+  });
+}
+
 /** Contents of a config file that actually redirect a registry. */
 export function fileRedirectsRegistry(lower, text) {
   if (!INDEX_OVERRIDE_FILES.has(lower)) {
@@ -328,6 +362,7 @@ export function fileRedirectsRegistry(lower, text) {
       return 'cargo source replacement';
     return null;
   }
+  if (onlyHarmlessSettings(lower, text)) return null;
   if (
     /(?:^|\n)\s*(?:registry|index-url|extra-index-url|npmRegistryServer|index|url)\s*[:=]/i.test(
       text,

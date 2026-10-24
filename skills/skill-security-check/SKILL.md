@@ -79,17 +79,21 @@ The static analysis runs in a child process under the Node permission model: it 
 - `--strict` returns to the old all-or-nothing policy: every external address and every unknown package rejects. `--trust <file>` loads a trust override instead of `$AGENTPM_HOME/skill-trust.json`; `--no-trust` ignores any override. See `references/trust.md`.
 - Exit codes: `0` PASS, `1` REVIEW, `2` REJECT, `3` usage or internal error.
 
-The report footer carries two hashes. `ruleset` covers all four scanner files, `policy` covers the effective trust data and the mode. An approval binds to the content digest **and** both hashes: if either changes, the skill needs a new decision.
+The report footer carries two hashes. `ruleset` covers all scanner and signature files, `policy` covers the effective trust data and the mode. An approval binds to the content digest **and** both hashes: if either changes, the skill needs a new decision.
 
-The antivirus step uses the local engine. Each engine must first flag a harmless test sample. An engine that fails this canary counts as not working.
+The antivirus step always runs the bundled engine, `scripts/tiny-av.mjs`, and adds the system engine when there is one. Each engine must first flag a harmless test sample. An engine that fails this canary counts as not working.
 
-| Platform | Engines                                                                                                                           |
+The bundled engine is pure Node, needs no install, and runs in the same read-only sandbox as the static analysis. It unpacks base64, hex, `\x` escapes, `0x` byte lists, UTF-16, gzip, zlib and zip, up to four layers deep. Then it matches a small set of signatures: test samples, Metasploit shellcode, Mimikatz and PowerSploit commands, crypto miners, shellcode loaders, process injection, Chromium password theft and PHP web shells. A Windows, Linux or macOS program hidden inside a text encoding is a detection of its own. Documentation may name attack tools; a script, or anything hidden in an encoding, may not. The signatures are stored XOR-encoded so the host antivirus does not quarantine the skill. `node scripts/tiny-av.mjs --list-signatures` prints them decoded.
+
+The bundled engine does not know current malware families. A system engine is still the better layer.
+
+| Platform | System engines                                                                                                                    |
 | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Windows  | Microsoft Defender when active, otherwise AMSI (reaches AVG, Avast, ESET and other registered products), plus ClamAV if installed |
 | Linux    | ClamAV: `sudo apt install clamav && sudo freshclam` (or the distro equivalent)                                                    |
 | macOS    | ClamAV: `brew install clamav`, then set up `freshclam.conf` and run `freshclam`. XProtect has no scan command.                    |
 
-Without a working engine, a skill with scripts or binaries gets REVIEW, not PASS.
+A Defender that is turned off because another product is active is listed as `off` and does not raise a finding. When only the bundled engine works, the report says so as INFO (`av-bundled-only`). When no engine works at all, a skill with scripts or binaries gets REVIEW, not PASS.
 
 ## Step 3: Act on the verdict
 

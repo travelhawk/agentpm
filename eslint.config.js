@@ -9,6 +9,13 @@ module.exports = tseslint.config(
       '**/node_modules/**',
       '**/.turbo/**',
       '**/coverage/**',
+      // Local, untracked editor/agent tooling directories. They are not part of
+      // the project sources and may hold files in module formats this config
+      // does not describe, which would otherwise fail `pnpm lint` for anyone
+      // who happens to have them checked out locally.
+      '**/.claude/**',
+      '**/.idea/**',
+      '**/.vscode/**',
       'apps/cli/bin/**',
       'eslint.config.js',
       'prettier.config.mjs',
