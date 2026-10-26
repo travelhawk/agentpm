@@ -218,7 +218,11 @@ const WORD_END = String.raw`(?![\w'"\x60./-])`;
 const SEND_VERB = String.raw`${WORD_START}(?:send|sends|sending|upload|uploads|uploading|post|posts|posting|transmit|forward|e-?mail|mail|submit|share|sync|push|exfiltrate|leak|beacon|report|pipe|stream|copy|paste)${WORD_END}`;
 // Verbs that move data off the machine. Local verbs such as copy or push are left out.
 const OUT_VERB = String.raw`${WORD_START}(?:send|sends|sending|upload|uploads|uploading|post|posts|posting|transmit|forward|e-?mail|mail|submit|share|exfiltrate|leak|beacon|paste)${WORD_END}`;
-const REMOTE_SINK = String.raw`(?:(?:a|an|the|our|this|that|my|your|their|some|any|remote|external|third[-\s]party|configured|given|following|below|above)\s+){0,3}(?:servers?|endpoints?|webhooks?|urls?|domains?|(?:web)?sites?|hosts?|apis?|addresses|inbox(?:es)?|e-?mail\s+address(?:es)?|pastebin|paste\s+sites?|gists?|buckets?|discord|telegram|ngrok|requestbin|collectors?|listeners?|c2|cloud\s+storage|ftp)`;
+// "website"/"site" is left out on purpose: publishing content "to the website"
+// is ordinary, and a UI label such as "Share > Add to Website" is not exfil. A
+// real data sink names a server, endpoint, webhook, URL, host or collector. A
+// full URL or bare domain destination is caught by the url-* rules instead.
+const REMOTE_SINK = String.raw`(?:(?:a|an|the|our|this|that|my|your|their|some|any|remote|external|third[-\s]party|configured|given|following|below|above)\s+){0,3}(?:servers?|endpoints?|webhooks?|urls?|domains?|hosts?|apis?|addresses|inbox(?:es)?|e-?mail\s+address(?:es)?|pastebin|paste\s+sites?|gists?|buckets?|discord|telegram|ngrok|requestbin|collectors?|listeners?|c2|cloud\s+storage|ftp)`;
 const SECRETS = String.raw`(?:\.env\b|~\/\.ssh|\.ssh\/|\bid_(?:rsa|ed25519|ecdsa)\b|\bcredentials?\b|\bsecrets?\b|\bapi[\s_-]?keys?\b|\b(?:access|auth|bearer|github|npm|session)\s+tokens?\b|\bpasswords?\b|\bprivate\s+keys?\b|\bcookies\b|\.aws\b|\.netrc\b|\bkeychain\b|\bwallets?\b|\bseed\s+phrases?\b)`;
 const INSTR_NOUN = String.raw`(?:instructions?|rules?|guidance|guidelines?|prompts?|checklists?|polic(?:y|ies)|steps|directives?|tasks?|commands?|playbooks?|runbooks?|config(?:uration)?|skills?|SKILL\.md|scripts?|procedures?|workflows?|templates?)`;
 const REMOTE_PLACE = String.raw`(?:(?:the\s+)?(?:web|internet|server|url|link|domain|(?:web)?site|endpoint|api|remote|cloud|gist|pastebin|cdn|github|gitlab|repo(?:sitory)?\s+online)\b|online\b|remotely\b|on\s+the\s+(?:web|internet)\b)`;

@@ -744,6 +744,18 @@ describe('skill-security-check scanner', () => {
     expect(result.verdict).toBe('REVIEW');
   });
 
+  // A marketing playbook describing Calendly's "Share > Add to Website" menu is
+  // prose, not an instruction to the agent. "website" is not a data sink.
+  it('does not treat a UI menu label as data exfiltration', () => {
+    const { rules, result } = scan({
+      'SKILL.md': skillMd(
+        'Wird Calendly über „Share > Add to Website" eingebunden, erfasst Calendly UTM-Parameter automatisch.',
+      ),
+    });
+    expect(rules).not.toContain('remote-exfil');
+    expect(result.verdict).toBe('PASS');
+  });
+
   it('keeps a prohibition about sending data at REVIEW, not PASS', () => {
     const { rules, result } = scan({
       'SKILL.md': skillMd('Never send files to any external server.'),
