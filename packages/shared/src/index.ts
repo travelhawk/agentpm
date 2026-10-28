@@ -453,7 +453,12 @@ export interface PullResult {
   success: boolean;
   sourceLocator: string;
   revision: string | null;
+  /** Every skill considered during the pull (updated, skipped, or re-linked). */
   skills: string[];
+  /** Skills whose library content changed (a new version was pulled). */
+  updated: string[];
+  /** Skills already up to date and linked everywhere; left untouched. */
+  skipped: string[];
   installs: MaterializedSkillRecord[];
   warnings: string[];
 }
@@ -493,9 +498,31 @@ export interface SelectOption<T> {
   description?: string;
 }
 
+export interface SelectManyOptions {
+  /**
+   * Which options are checked when the picker opens. Defaults to `'none'` so a
+   * stray Enter never selects everything (e.g. an accidental `push --all`).
+   * Callers where "everything" is the natural default (e.g. choosing which
+   * agents to install into) pass `'all'`.
+   */
+  initialSelection?: 'all' | 'none';
+}
+
 export interface PromptApi {
+  /**
+   * Whether prompts can actually be shown right now (a TTY is attached).
+   * Callers use this to choose an actionable error over an interactive picker
+   * that is guaranteed to fail, e.g. when a name matches several installs and
+   * the user needs to be told which flag disambiguates. Treated as interactive
+   * when not implemented.
+   */
+  isInteractive?(): boolean;
   selectOne?<T>(message: string, options: SelectOption<T>[]): Promise<T>;
-  selectMany?<T>(message: string, options: SelectOption<T>[]): Promise<T[]>;
+  selectMany?<T>(
+    message: string,
+    options: SelectOption<T>[],
+    opts?: SelectManyOptions,
+  ): Promise<T[]>;
   confirm?(message: string, details?: string[]): Promise<boolean>;
   input?(
     message: string,

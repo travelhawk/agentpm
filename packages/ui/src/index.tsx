@@ -2,7 +2,11 @@ import { Box, Text, render, useApp, useInput } from 'ink';
 import { createInterface } from 'node:readline/promises';
 import React, { useMemo, useState } from 'react';
 
-import type { PromptApi, SelectOption } from '@agentpm/shared';
+import type {
+  PromptApi,
+  SelectManyOptions,
+  SelectOption,
+} from '@agentpm/shared';
 import { AgentPmError } from '@agentpm/shared';
 
 interface SelectComponentProps<T> {
@@ -78,6 +82,7 @@ interface ConfirmComponentProps {
 interface MultiSelectComponentProps<T> {
   message: string;
   options: SelectOption<T>[];
+  initialSelection: 'all' | 'none';
   resolve: (value: T[]) => void;
   reject: (error: Error) => void;
 }
@@ -134,12 +139,19 @@ function ConfirmComponent({
 function MultiSelectComponent<T>({
   message,
   options,
+  initialSelection,
   resolve,
   reject,
 }: MultiSelectComponentProps<T>): React.JSX.Element {
   const [index, setIndex] = useState(0);
-  const [selected, setSelected] = useState<Set<number>>(
-    () => new Set(options.map((_, optionIndex) => optionIndex)),
+  // Default to nothing selected so the user explicitly opts in to each entry —
+  // pre-selecting everything turns a bare `agentpm push` into an accidental
+  // `--all`. Callers that genuinely want all (e.g. agent targets) opt in via
+  // `initialSelection: 'all'`. Press `a` to select all, `n` for none.
+  const [selected, setSelected] = useState<Set<number>>(() =>
+    initialSelection === 'all'
+      ? new Set(options.map((_, optionIndex) => optionIndex))
+      : new Set(),
   );
   const { exit } = useApp();
 
@@ -324,6 +336,7 @@ export async function promptToInput(
 export async function promptToSelectMany<T>(
   message: string,
   options: SelectOption<T>[],
+  opts: SelectManyOptions = {},
 ): Promise<T[]> {
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
     throw new AgentPmError(
@@ -340,6 +353,7 @@ export async function promptToSelectMany<T>(
       <MultiSelectComponent
         message={message}
         options={options}
+        initialSelection={opts.initialSelection ?? 'none'}
         resolve={resolve}
         reject={reject}
       />,
@@ -348,8 +362,13 @@ export async function promptToSelectMany<T>(
   });
 }
 
+export function isInteractiveTerminal(): boolean {
+  return Boolean(process.stdout.isTTY && process.stdin.isTTY);
+}
+
 export function createPromptApi(): PromptApi {
   return {
+    isInteractive: isInteractiveTerminal,
     selectOne: promptToSelectOne,
     selectMany: promptToSelectMany,
     confirm: promptToConfirm,

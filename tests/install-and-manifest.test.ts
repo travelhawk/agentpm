@@ -14,7 +14,11 @@ import {
   writeFile,
 } from './helpers';
 
-const CI_TEST_TIMEOUT = process.env.CI ? 30_000 : 15_000;
+// Tests here shell out to the CLI (often twice, through tsx with its cache
+// disabled), so a single case can legitimately take well over ten seconds on a
+// busy machine. Use the same budget locally as on CI: the tighter local limit
+// only produced timeout flakes, never a faster signal.
+const CI_TEST_TIMEOUT = 30_000;
 
 async function writeGitGlobalIgnoreConfig(
   rootDir: string,

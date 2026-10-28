@@ -244,3 +244,14 @@ export async function materializeArchive(
   }
 }
 
+/**
+ * True when `candidate` is `parentDir` itself or lives underneath it. Both sides
+ * are resolved first, so this is safe to use for "is this path inside storage we
+ * own?" checks on mixed absolute/relative input.
+ */
+export function isWithinDirectory(parentDir: string, candidate: string): boolean {
+  const parent = path.resolve(parentDir);
+  const child = path.resolve(candidate);
+  return child === parent || child.startsWith(`${parent}${path.sep}`);
+}
+

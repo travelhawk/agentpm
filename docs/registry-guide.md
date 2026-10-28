@@ -9,7 +9,7 @@ AgentPM supports two registry flavors under the `registry` source kind:
    users, tokens, and visibility, serves a compatible `/index.json`, and ships
    a web UI for browsing and curation.
 
-The `skills.sh` CLI bridge is separate from this registry model. Use `agentpm skills search` and `agentpm skills install` when you want no-key public discovery or import without treating the provider as a normal indexed source.
+The `skills.sh` bridge is separate from this registry model. Use `agentpm skills search` and `agentpm skills install` when you want no-key public discovery or import without treating the provider as a normal indexed source.
 
 ## Supported format
 

@@ -1,12 +1,16 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-
 import { AgentPmError } from '@agentpm/shared';
 
-const execFileAsync = promisify(execFile);
+const SKILLS_SH_PUBLIC_URL = 'https://skills.sh';
+// Tests and mirrors can point the bridge at another origin.
+const SKILLS_SH_URL_ENV = 'AGENTPM_SKILLS_SH_URL';
+const SKILLS_SH_SEARCH_LIMIT = 10;
+const SKILLS_SH_TIMEOUT_MS = 15_000;
+const SKILLS_SH_MAX_RESPONSE_CHARS = 2 * 1024 * 1024;
 
-const ANSI_ESCAPE_PATTERN =
-  /[\u001B\u009B][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+// Search results are third-party text that ends up in the terminal and in
+// install selectors, so anything with control characters is dropped.
+const CONTROL_CHARACTER_PATTERN = /[\x00-\x1F\x7F-\x9F]/;
+const PROVIDER_SKILL_ID_PATTERN = /^[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*$/;
 
 export type ProviderId = 'skills.sh';
 
@@ -57,10 +61,6 @@ export function formatProviderSkillSelector(
     return `${githubSource}@${normalizedSkill}`;
   }
   return null;
-}
-
-function stripAnsi(text: string): string {
-  return text.replace(ANSI_ESCAPE_PATTERN, '');
 }
 
 function normalizeProviderId(provider: string): ProviderId {
@@ -139,93 +139,143 @@ function parseProviderSelector(selector: string): {
   };
 }
 
-async function runSkillsCli(
-  args: string[],
-  env: NodeJS.ProcessEnv,
-): Promise<string> {
-  const command = process.platform === 'win32' ? 'cmd.exe' : 'npx';
-  const commandArgs =
-    process.platform === 'win32'
-      ? ['/d', '/s', '/c', 'npx', 'skills', ...args]
-      : ['skills', ...args];
+function resolveSkillsShBaseUrl(env: NodeJS.ProcessEnv): URL {
+  const override = env[SKILLS_SH_URL_ENV]?.trim();
+  let base: URL;
   try {
-    const { stdout } = await execFileAsync(command, commandArgs, {
-      env: {
-        ...process.env,
-        ...env,
-        DISABLE_TELEMETRY: '1',
-        NO_COLOR: '1',
-        FORCE_COLOR: '0',
-      },
-      maxBuffer: 1024 * 1024 * 10,
+    base = new URL(override || SKILLS_SH_PUBLIC_URL);
+  } catch {
+    throw new AgentPmError(
+      `${SKILLS_SH_URL_ENV} is not a valid URL: "${override ?? ''}".`,
+    );
+  }
+  if (base.protocol !== 'https:' && base.protocol !== 'http:') {
+    throw new AgentPmError(`${SKILLS_SH_URL_ENV} must be an http(s) URL.`);
+  }
+  return base;
+}
+
+async function fetchSkillsShSearch(
+  query: string,
+  env: NodeJS.ProcessEnv,
+): Promise<unknown> {
+  const url = new URL('/api/search', resolveSkillsShBaseUrl(env));
+  url.searchParams.set('q', query);
+  url.searchParams.set('limit', String(SKILLS_SH_SEARCH_LIMIT));
+
+  let status: number;
+  let text: string;
+  try {
+    const response = await fetch(url, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(SKILLS_SH_TIMEOUT_MS),
     });
-    return stdout;
+    status = response.status;
+    text = await response.text();
   } catch (error: unknown) {
-    const details =
-      error && typeof error === 'object' && 'stdout' in error
-        ? String((error as { stdout?: string }).stdout ?? '')
-        : '';
-    if (details.trim()) {
-      return details;
-    }
-    const reason =
-      error instanceof Error && 'code' in error && error.code === 'ENOENT'
-        ? 'Could not run `npx skills`. Ensure Node.js and npm are installed and available on PATH.'
-        : `Provider bridge command failed: ${error instanceof Error ? error.message : String(error)}`;
-    throw new AgentPmError(details ? `${reason}\n\n${details}` : reason);
+    const cause =
+      error instanceof Error && error.cause instanceof Error
+        ? error.cause.message
+        : null;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new AgentPmError(
+      `Could not reach skills.sh at ${url.origin}: ${cause ?? reason}`,
+    );
+  }
+
+  if (status < 200 || status >= 300) {
+    throw new AgentPmError(`skills.sh search failed with HTTP ${status}.`);
+  }
+  if (text.length > SKILLS_SH_MAX_RESPONSE_CHARS) {
+    throw new AgentPmError('skills.sh returned an oversized search response.');
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new AgentPmError(
+      'skills.sh returned an unexpected search response (not JSON).',
+    );
   }
 }
 
-export function parseSkillsProviderSearchOutput(
-  output: string,
-): ProviderSkillSearchResult[] {
-  const cleaned = stripAnsi(output)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+function formatInstallCount(value: unknown): string | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(1).replace(/.0$/, '')}M`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(1).replace(/.0$/, '')}K`;
+  }
+  return String(Math.trunc(value));
+}
 
-  if (
-    cleaned.length === 0 ||
-    cleaned.some((line) => line.startsWith('No skills found for '))
-  ) {
-    return [];
+function isSafeProviderSkillId(id: string): boolean {
+  return (
+    PROVIDER_SKILL_ID_PATTERN.test(id) &&
+    !id.split('/').some((segment) => /^\.+$/.test(segment))
+  );
+}
+
+function readCleanString(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || CONTROL_CHARACTER_PATTERN.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+export function parseSkillsProviderSearchResponse(
+  body: unknown,
+): ProviderSkillSearchResult[] {
+  const skills =
+    body && typeof body === 'object' && 'skills' in body
+      ? (body as { skills?: unknown }).skills
+      : undefined;
+  if (!Array.isArray(skills)) {
+    throw new AgentPmError(
+      'skills.sh returned an unexpected search response (missing "skills" list).',
+    );
   }
 
   const results: ProviderSkillSearchResult[] = [];
-  for (const line of cleaned) {
-    const normalizedLine = line.replace(/^└\s*/, '');
-    const match = normalizedLine.match(
-      /^([^/\s]+\/[^@\s]+@[^\s]+)\s+(.+?) installs$/i,
-    );
-    if (match) {
-      const selector = match[1]!;
-      const installs = match[2]!;
-      const parsed = parseProviderSelector(selector);
-      results.push({
-        provider: 'skills.sh',
-        name: parsed.skill,
-        source: parsed.source,
-        installLocator: parsed.installLocator,
-        skillSelector: selector,
-        url: null,
-        installs,
-        description: null,
-        raw: normalizedLine,
-      });
+  for (const entry of skills) {
+    if (!entry || typeof entry !== 'object') {
       continue;
     }
-
-    const urlMatch = normalizedLine.match(/^https:\/\/\S+$/);
-    if (urlMatch && results.length > 0) {
-      results[results.length - 1]!.url = urlMatch[0];
+    const record = entry as Record<string, unknown>;
+    const source = readCleanString(record.source);
+    const name =
+      readCleanString(record.name) ?? readCleanString(record.skillId);
+    if (!source || !name) {
+      continue;
     }
-  }
-
-  if (results.length === 0) {
-    const preview = cleaned.slice(0, 5).join('\n');
-    throw new AgentPmError(
-      `skills.sh CLI returned unexpected search output.\n\n${preview}`,
-    );
+    const selector = `${source}@${name}`;
+    // Entries that are not "owner/repo@skill" cannot flow through the Git
+    // install path, so they are skipped like the old CLI bridge did.
+    if (!isProviderSelectorCandidate(selector)) {
+      continue;
+    }
+    const parsed = parseProviderSelector(selector);
+    const id = readCleanString(record.id);
+    results.push({
+      provider: 'skills.sh',
+      name: parsed.skill,
+      source: parsed.source,
+      installLocator: parsed.installLocator,
+      skillSelector: selector,
+      url:
+        id && isSafeProviderSkillId(id)
+          ? `${SKILLS_SH_PUBLIC_URL}/${id}`
+          : null,
+      installs: formatInstallCount(record.installs),
+      description: readCleanString(record.description),
+      raw: JSON.stringify(record),
+    });
   }
 
   return results;
@@ -243,8 +293,11 @@ export async function searchProviderSkills(
   if (!query.trim()) {
     throw new AgentPmError('A provider search query is required.');
   }
-  const output = await runSkillsCli(['find', query.trim()], env);
-  return parseSkillsProviderSearchOutput(output);
+  const body = await fetchSkillsShSearch(query.trim(), {
+    ...process.env,
+    ...env,
+  });
+  return parseSkillsProviderSearchResponse(body);
 }
 
 export function resolveProviderInstallRequest(

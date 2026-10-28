@@ -11,3 +11,4 @@ coverage/
 pnpm-lock.yaml
 !pnpm-lock.yaml
 
+.idea/
