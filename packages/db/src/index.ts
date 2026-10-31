@@ -103,6 +103,48 @@ function mapInstall(row: Record<string, unknown>): InstallRecord {
   };
 }
 
+const INSTALL_COLUMNS = `id, name, source_id, catalog_entry_id, adapter, scope, scope_root, target_path,
+  link_target, source_relative_path, source_root_relative_path, selected_items_json, content_kind,
+  content_locator, content_ref, cache_key, installed_revision, layout_signature, metadata_json,
+  created_at, updated_at`;
+
+// installs.source_id has no foreign key on purpose: an install keeps its own
+// content locator, so it can outlive a removed source. Source ids are
+// deterministic, so re-adding the same source links the install again.
+function installsTableSql(tableName: string): string {
+  return `
+    create table if not exists ${tableName} (
+      id text primary key,
+      name text not null,
+      source_id text not null,
+      catalog_entry_id text references catalog_entries(id) on delete set null,
+      adapter text not null,
+      scope text not null,
+      scope_root text not null,
+      target_path text not null unique,
+      link_target text not null,
+      source_relative_path text not null,
+      source_root_relative_path text not null,
+      selected_items_json text not null default '[]',
+      content_kind text not null,
+      content_locator text not null,
+      content_ref text,
+      cache_key text,
+      installed_revision text,
+      layout_signature text not null,
+      metadata_json text not null default '{}',
+      created_at text not null,
+      updated_at text not null
+    );
+  `;
+}
+
+const INSTALLS_INDEXES_SQL = `
+  create index if not exists installs_name_idx on installs(name);
+  create index if not exists installs_source_id_idx on installs(source_id);
+  create index if not exists installs_cache_key_idx on installs(cache_key);
+`;
+
 export class AgentPmDatabase {
   private readonly database: DatabaseSync;
 
@@ -160,33 +202,41 @@ export class AgentPmDatabase {
         updated_at text not null
       );
 
-      create table if not exists installs (
-        id text primary key,
-        name text not null,
-        source_id text not null references sources(id) on delete restrict,
-        catalog_entry_id text references catalog_entries(id) on delete set null,
-        adapter text not null,
-        scope text not null,
-        scope_root text not null,
-        target_path text not null unique,
-        link_target text not null,
-        source_relative_path text not null,
-        source_root_relative_path text not null,
-        selected_items_json text not null default '[]',
-        content_kind text not null,
-        content_locator text not null,
-        content_ref text,
-        cache_key text,
-        installed_revision text,
-        layout_signature text not null,
-        metadata_json text not null default '{}',
-        created_at text not null,
-        updated_at text not null
-      );
-      create index if not exists installs_name_idx on installs(name);
-      create index if not exists installs_source_id_idx on installs(source_id);
-      create index if not exists installs_cache_key_idx on installs(cache_key);
+      ${installsTableSql('installs')}
+      ${INSTALLS_INDEXES_SQL}
     `);
+    this.dropInstallSourceForeignKey();
+  }
+
+  // Databases created before installs could outlive their source still carry
+  // an `on delete restrict` key on installs.source_id. SQLite cannot drop a
+  // foreign key in place, so rebuild the table once without it.
+  private dropInstallSourceForeignKey(): void {
+    const foreignKeys = this.database
+      .prepare('PRAGMA foreign_key_list(installs)')
+      .all() as Array<{ from: string }>;
+    if (!foreignKeys.some((key) => key.from === 'source_id')) {
+      return;
+    }
+
+    this.database.exec('PRAGMA foreign_keys = OFF');
+    this.database.exec('BEGIN');
+    try {
+      this.database.exec(`
+        ${installsTableSql('installs_next')}
+        insert into installs_next (${INSTALL_COLUMNS})
+          select ${INSTALL_COLUMNS} from installs;
+        drop table installs;
+        alter table installs_next rename to installs;
+        ${INSTALLS_INDEXES_SQL}
+      `);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    } finally {
+      this.database.exec('PRAGMA foreign_keys = ON');
+    }
   }
 
   upsertSource(source: SourceRecord): SourceRecord {

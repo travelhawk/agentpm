@@ -13,6 +13,7 @@ import {
   type InstallOptions,
   type ProviderInstalledSkillRecord,
   type ProviderSkillSearchResult,
+  type RemoveSourceResult,
   type UpdateOptions,
 } from '@agentpm/core';
 import {
@@ -214,9 +215,9 @@ function errorGuidance(message: string): string[] {
       'Verify network access and retry with `agentpm skills search <query>` before installing.',
     );
   }
-  if (/Cannot remove source/i.test(message)) {
+  if (/is still used by .* installed skill/i.test(message)) {
     hints.push(
-      'Remove dependent installs first with `agentpm list` and `agentpm remove <name>`.',
+      'Run the command in a terminal without flags to choose from a list.',
     );
   }
   if (/agentpm\.yaml|manifest/i.test(message)) {
@@ -1192,22 +1193,93 @@ addExamples(
   ],
 );
 
-source
-  .command('remove')
-  .argument('<source>', 'Source id or locator')
-  .option('--json', 'Print machine-readable JSON')
-  .action(async (sourceToken: string, flags: { json?: boolean }) => {
-    await withService((service) => service.removeSource(sourceToken));
-    if (flags.json) {
-      printSuccessJson('source.remove', {
-        source: sourceToken,
-      });
-      return;
-    }
+addExamples(
+  source
+    .command('remove')
+    .argument('<source>', 'Source id or locator')
+    .option(
+      '--keep-installs',
+      'Keep skills installed from this source; they still update from their origin',
+    )
+    .option('--remove-installs', 'Also uninstall skills installed from this source')
+    .option('--yes', 'Keep installed skills without asking (same as --keep-installs)')
+    .option('--json', 'Print machine-readable JSON')
+    .action(
+      async (
+        sourceToken: string,
+        flags: {
+          keepInstalls?: boolean;
+          removeInstalls?: boolean;
+          yes?: boolean;
+          json?: boolean;
+        },
+      ) => {
+        if (flags.removeInstalls && (flags.keepInstalls || flags.yes)) {
+          throw new Error(
+            'Choose one: --keep-installs (or --yes) keeps the skills, --remove-installs uninstalls them.',
+          );
+        }
+        const installs = flags.removeInstalls
+          ? ('remove' as const)
+          : flags.keepInstalls || flags.yes
+            ? ('keep' as const)
+            : undefined;
+        const result = await withService((service) =>
+          service.removeSource(sourceToken, { installs }),
+        );
+        const keptNames = [...new Set(result.keptInstalls.map((i) => i.name))];
+        const removedNames = [
+          ...new Set(result.removedInstalls.map((i) => i.name)),
+        ];
+        if (flags.json) {
+          printSuccessJson('source.remove', {
+            source: sourceToken,
+            removed: result.removed,
+            keptInstalls: keptNames,
+            removedInstalls: removedNames,
+          });
+          return;
+        }
+        printSourceRemoval(result.source, result.removed, keptNames, removedNames);
+      },
+    ),
+  [
+    'agentpm source remove skills-vault',
+    'agentpm source remove skills-vault --keep-installs',
+    'agentpm source remove skills-vault --remove-installs',
+  ],
+);
+
+function printSourceRemoval(
+  removedSource: RemoveSourceResult['source'],
+  removed: boolean,
+  keptNames: string[],
+  removedNames: string[],
+): void {
+  const name = style.cyan(removedSource.displayName);
+  if (!removed) {
+    console.log(`\n${symbols.info} Nothing changed. Source ${name} is still configured.\n`);
+    return;
+  }
+  const skills = (names: string[]) =>
+    `${names.length} skill${names.length === 1 ? '' : 's'}`;
+  if (removedNames.length > 0) {
     console.log(
-      `\n${symbols.success} ${style.bold('Removed source')} ${style.cyan(sourceToken)}\n`,
+      `\n${symbols.success} ${style.bold('Removed source')} ${name} and uninstalled ${skills(removedNames)}: ${removedNames.join(', ')}\n`,
     );
-  });
+    return;
+  }
+  console.log(`\n${symbols.success} ${style.bold('Removed source')} ${name}`);
+  if (keptNames.length > 0) {
+    console.log(
+      `  ${symbols.bullet} Kept ${skills(keptNames)}: ${keptNames.join(', ')}`,
+    );
+    console.log(
+      `  ${symbols.bullet} To link to the source again:${style.cyan(`agentpm source add ${removedSource.locator}`)}`,
+    );
+  }
+  console.log('');
+}
 
 const targetCmd = addExamples(
   program
@@ -2488,7 +2560,9 @@ try {
     console.error(
       `\n${symbols.error} ${style.bold(style.red('AgentPM Command Failed'))}`,
     );
-    console.error(`  ${style.red(err.message)}`);
+    for (const line of err.message.split('\n')) {
+      console.error(`  ${style.red(line)}`);
+    }
     if (hints.length > 0) {
       console.error('');
       for (const hint of hints) {

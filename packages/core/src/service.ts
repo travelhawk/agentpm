@@ -104,6 +104,21 @@ import {
   searchProviderSkills,
   type ProviderSkillSearchResult,
 } from './provider-bridge.js';
+import {
+  detachInstallFromSource,
+  sourceInstallsChoiceRequiredMessage,
+  sourceInstallsChoices,
+  sourceInstallsPrompt,
+  type RemoveSourceOptions,
+  type RemoveSourceResult,
+  type SourceInstallsAction,
+} from './source-removal.js';
+
+export type {
+  RemoveSourceOptions,
+  RemoveSourceResult,
+  SourceInstallsAction,
+} from './source-removal.js';
 
 export interface AddSourceResult {
   source: SourceRecord;
@@ -523,20 +538,64 @@ export class AgentPmService {
     return results;
   }
 
-  async removeSource(sourceToken: string): Promise<void> {
+  async removeSource(
+    sourceToken: string,
+    options: RemoveSourceOptions = {},
+  ): Promise<RemoveSourceResult> {
     await this.initialize();
     const source = this.findSourceByToken(sourceToken);
     if (!source) {
       throw new AgentPmError(`Unknown source: ${sourceToken}`);
     }
 
-    if (this.db.countInstallsForSource(source.id) > 0) {
-      throw new AgentPmError(
-        `Cannot remove source "${source.displayName}" while installs still depend on it.`,
-      );
+    const dependents = this.db.listInstallsBySource(source.id);
+    const result: RemoveSourceResult = {
+      source,
+      removed: false,
+      keptInstalls: [],
+      removedInstalls: [],
+    };
+
+    let action = options.installs;
+    if (dependents.length > 0 && !action) {
+      const choice = await this.chooseSourceInstallsAction(source, dependents);
+      if (choice === 'cancel') {
+        return result;
+      }
+      action = choice;
+    }
+
+    for (const install of dependents) {
+      if (action === 'remove') {
+        result.removedInstalls.push(await this.removeInstallRecord(install, {}));
+      } else {
+        result.keptInstalls.push(
+          this.db.saveInstall(detachInstallFromSource(install, source, nowIso())),
+        );
+      }
     }
 
     this.db.deleteSource(source.id);
+    return { ...result, removed: true };
+  }
+
+  private async chooseSourceInstallsAction(
+    source: SourceRecord,
+    installs: InstallRecord[],
+  ): Promise<SourceInstallsAction | 'cancel'> {
+    // Local installs link straight into the source folder, so a missing
+    // folder means the skills are already broken.
+    const sourceContentMissing =
+      source.kind === 'local' && !(await pathExists(source.locator));
+    if (!this.prompts.selectOne || this.prompts.isInteractive?.() === false) {
+      throw new AgentPmError(
+        sourceInstallsChoiceRequiredMessage(source, installs, sourceContentMissing),
+      );
+    }
+    return this.prompts.selectOne(
+      sourceInstallsPrompt(source, installs),
+      sourceInstallsChoices(installs, sourceContentMissing),
+    );
   }
 
   async inspect(
@@ -2894,7 +2953,7 @@ export class AgentPmService {
           sourceId: source.id,
           path: source.locator,
           message: `Local source is missing: ${source.locator}`,
-          remedy: 'Remove or re-add the source with a valid path.',
+          remedy: `Re-add the source with a valid path, or run \`agentpm source remove ${source.id}\` to remove it and the skills that used it.`,
         });
       }
 
@@ -3076,10 +3135,11 @@ export class AgentPmService {
           results.push({ action, applied: false });
           continue;
         }
+        // Planned only for unused sources. If an install appeared since, leave
+        // the source for `agentpm source remove`, which asks about its skills.
         if (this.db.countInstallsForSource(source.id) > 0) {
-          throw new AgentPmError(
-            `Cannot remove source "${source.displayName}" while installs still depend on it.`,
-          );
+          results.push({ action, applied: false });
+          continue;
         }
         this.db.deleteSource(source.id);
         results.push({ action, applied: true });
