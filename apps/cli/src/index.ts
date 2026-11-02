@@ -22,8 +22,24 @@ import {
   getRegistryToken,
 } from '@agentpm/registry';
 import { startRegistryServer } from '@agentpm/registry-server';
-import { createPromptApi, promptToConfirm, promptToInput } from '@agentpm/ui';
+import {
+  createPromptApi,
+  isInteractiveTerminal,
+  promptToConfirm,
+  promptToInput,
+  promptToSelectOne,
+} from '@agentpm/ui';
 
+import {
+  confirmOrExplain,
+  doctorFixesNeedYesMessage,
+  updatesNeedYesMessage,
+  type ConfirmDeps,
+} from './guided-confirm.js';
+import {
+  assertRegistryLoginAnswerable,
+  chooseRegistryUrl,
+} from './registry-args.js';
 import { resolveTargetAddArgs } from './target-add.js';
 
 
@@ -186,7 +202,7 @@ function printQuickstart(flow?: QuickstartFlow): void {
   }
 }
 
-function errorGuidance(message: string): string[] {
+function errorGuidance(message: string, commandPath = 'agentpm'): string[] {
   const hints: string[] = [];
   if (
     /No sources have been added yet|No catalog entries are indexed yet/i.test(
@@ -200,7 +216,7 @@ function errorGuidance(message: string): string[] {
       'List configured sources with `agentpm source list` and retry with the exact source id.',
     );
   }
-  if (/interactive TTY|Re-run interactively/i.test(message)) {
+  if (/interactive TTY|Re-run interactively|requires a TTY/i.test(message)) {
     hints.push(
       'Pass explicit flags like `--skill`, `--all`, `--from`, or `--yes` when running non-interactively.',
     );
@@ -238,6 +254,13 @@ function errorGuidance(message: string): string[] {
   if (/matches more than one|Multiple (catalog )?entries/i.test(message)) {
     hints.push(
       'Narrow the match with `--kind <skill|agent|subagent|plugin>` and/or `--target <codex|claude|generic>`, or run interactively to pick from a list.',
+    );
+  }
+  // Commander's own usage errors ("missing required argument", "unknown
+  // option") are about how the command was typed, not the environment.
+  if (/^error: (missing|unknown|too many|option)/i.test(message)) {
+    hints.push(
+      `Run \`${commandPath} --help\` to see its arguments, options, and examples.`,
     );
   }
   if (hints.length === 0) {
@@ -778,6 +801,10 @@ function summarizeInstalls(
     );
 }
 
+function terminalConfirm(): ConfirmDeps {
+  return { isInteractive: isInteractiveTerminal(), confirm: promptToConfirm };
+}
+
 async function withService<T>(
   callback: (service: AgentPmService) => Promise<T>,
   options: {
@@ -1070,7 +1097,7 @@ skillsCmd
       }
 
       if (!flags.yes) {
-        const confirmed = await promptToConfirm(
+        const confirmed = await confirmOrExplain(
           'Do you want to update these skills.sh installs? [y/N]',
           changed.map((preview) => {
             const selector =
@@ -1079,6 +1106,11 @@ skillsCmd
                 : preview.install.name;
             return `${selector}: ${preview.currentRevision?.slice(0, 7) ?? 'n/a'} -> ${preview.candidateRevision?.slice(0, 7) ?? 'n/a'}`;
           }),
+          updatesNeedYesMessage(
+            changed.length,
+            ['agentpm skills update', ...identifiers].join(' '),
+          ),
+          terminalConfirm(),
         );
         if (!confirmed) {
           console.log(`\n${symbols.info} Update skipped.\n`);
@@ -1196,7 +1228,7 @@ addExamples(
 addExamples(
   source
     .command('remove')
-    .argument('<source>', 'Source id or locator')
+    .argument('[source]', 'Source id or locator. Omit to choose from a list.')
     .option(
       '--keep-installs',
       'Keep skills installed from this source; they still update from their origin',
@@ -1206,7 +1238,7 @@ addExamples(
     .option('--json', 'Print machine-readable JSON')
     .action(
       async (
-        sourceToken: string,
+        sourceToken: string | undefined,
         flags: {
           keepInstalls?: boolean;
           removeInstalls?: boolean;
@@ -1233,7 +1265,7 @@ addExamples(
         ];
         if (flags.json) {
           printSuccessJson('source.remove', {
-            source: sourceToken,
+            source: sourceToken ?? result.source.id,
             removed: result.removed,
             keptInstalls: keptNames,
             removedInstalls: removedNames,
@@ -1349,31 +1381,31 @@ addExamples(
 
 targetCmd
   .command('default')
-  .argument('<id>', 'Target ID')
+  .argument('[id]', 'Target ID. Omit to choose from a list.')
   .option('--json', 'Print machine-readable JSON')
-  .action(async (id: string, flags: { json?: boolean }) => {
-    await withService((service) => service.setDefaultTarget(id));
+  .action(async (id: string | undefined, flags: { json?: boolean }) => {
+    const targetId = await withService((service) => service.setDefaultTarget(id));
     if (flags.json) {
-      printSuccessJson('target.default', { id });
+      printSuccessJson('target.default', { id: targetId });
       return;
     }
     console.log(
-      `\n${symbols.success} ${style.bold('Default target')} ${style.cyan(id)} saved to global config\n`,
+      `\n${symbols.success} ${style.bold('Default target')} ${style.cyan(targetId)} saved to global config\n`,
     );
   });
 
 targetCmd
   .command('remove')
-  .argument('<id>', 'Target ID')
+  .argument('[id]', 'Target ID. Omit to choose from a list.')
   .option('--json', 'Print machine-readable JSON')
-  .action(async (id: string, flags: { json?: boolean }) => {
-    await withService((service) => service.removeTarget(id));
+  .action(async (id: string | undefined, flags: { json?: boolean }) => {
+    const targetId = await withService((service) => service.removeTarget(id));
     if (flags.json) {
-      printSuccessJson('target.remove', { id });
+      printSuccessJson('target.remove', { id: targetId });
       return;
     }
     console.log(
-      `\n${symbols.success} ${style.bold('Removed target')} ${style.cyan(id)} from global config\n`,
+      `\n${symbols.success} ${style.bold('Removed target')} ${style.cyan(targetId)} from global config\n`,
     );
   });
 
@@ -1610,12 +1642,17 @@ program
         }
 
         if (!flags.yes) {
-          const confirmed = await promptToConfirm(
+          const confirmed = await confirmOrExplain(
             'Do you want to update these skills? [y/N]',
             changed.map(
               (preview) =>
                 `${preview.install.name}: ${preview.currentRevision?.slice(0, 7) ?? 'n/a'} -> ${preview.candidateRevision?.slice(0, 7) ?? 'n/a'}`,
             ),
+            updatesNeedYesMessage(
+              changed.length,
+              ['agentpm update', ...names].join(' '),
+            ),
+            terminalConfirm(),
           );
           if (!confirmed) {
             console.log(`\n${symbols.info} Update skipped.\n`);
@@ -1664,14 +1701,14 @@ program
 
 program
   .command('remove')
-  .argument('<name>', 'Installed name')
+  .argument('[name]', 'Installed name. Omit to choose from a list.')
   .option('--purge', 'Also purge unused cache data')
   .option('--target <agent>', 'Remove one target agent (codex, claude, generic)')
   .option('--scope <scope>', 'Remove one install scope (global, project, workspace)')
   .option('--path <path>', 'Remove the install at an exact target path')
   .option('--json', 'Print machine-readable JSON')
   .action(async (
-    name: string,
+    name: string | undefined,
     flags: {
       purge?: boolean;
       target?: string;
@@ -1690,7 +1727,7 @@ program
     );
     if (flags.json) {
       printSuccessJson('remove', {
-        name,
+        name: name ?? removed.name,
         removed,
       });
       return;
@@ -2056,8 +2093,11 @@ addExamples(
           return;
         }
 
+        // Planning changes nothing, so without a terminal show the plan and
+        // ask for --yes only before applying it.
         const shouldPlan =
           flags.yes ||
+          !isInteractiveTerminal() ||
           (await promptToConfirm(
             'Errors detected. Would you like to attempt to fix these issues? [y/N]',
           ));
@@ -2103,7 +2143,13 @@ addExamples(
         }
 
         const shouldApply =
-          flags.yes || (await promptToConfirm('Apply these fixes? [y/N]'));
+          flags.yes ||
+          (await confirmOrExplain(
+            'Apply these fixes? [y/N]',
+            [],
+            doctorFixesNeedYesMessage(actions.length),
+            terminalConfirm(),
+          ));
         if (!shouldApply) {
           if (flags.json) {
             printSuccessJson('doctor', {
@@ -2146,18 +2192,10 @@ async function resolveRegistryUrl(explicit?: string): Promise<string> {
     return explicit;
   }
   const credentials = await loadRegistryCredentials();
-  const origins = Object.keys(credentials.registries);
-  if (origins.length === 1) {
-    return origins[0]!;
-  }
-  if (origins.length === 0) {
-    throw new Error(
-      'No registry configured. Pass --registry <url> or run `agentpm registry login <url>` first.',
-    );
-  }
-  throw new Error(
-    `Multiple registries configured (${origins.join(', ')}). Pass --registry <url> to choose one.`,
-  );
+  return chooseRegistryUrl(undefined, Object.keys(credentials.registries), {
+    isInteractive: isInteractiveTerminal(),
+    selectOne: promptToSelectOne,
+  });
 }
 
 function defaultRegistryDataDir(): string {
@@ -2253,6 +2291,7 @@ addExamples(
           json?: boolean;
         },
       ) => {
+        assertRegistryLoginAnswerable(url, flags, isInteractiveTerminal());
         let username = flags.username;
         let password = flags.password;
         if (!flags.token && !username) {
@@ -2545,6 +2584,23 @@ addExamples(
   ['agentpm guide', 'agentpm guide --json'],
 );
 
+/** The subcommand the user typed, e.g. "agentpm target default". */
+function commandPathFromArgs(args: string[]): string {
+  const names = ['agentpm'];
+  let command: Command = program;
+  for (const arg of args) {
+    const sub = command.commands.find(
+      (candidate) => candidate.name() === arg || candidate.aliases().includes(arg),
+    );
+    if (!sub) {
+      break;
+    }
+    names.push(sub.name());
+    command = sub;
+  }
+  return names.join(' ');
+}
+
 try {
   await program.parseAsync(process.argv);
 } catch (err: unknown) {
@@ -2552,7 +2608,7 @@ try {
     if (err.message === '(outputHelp)' || err.message === program.version()) {
       process.exit(0);
     }
-    const hints = errorGuidance(err.message);
+    const hints = errorGuidance(err.message, commandPathFromArgs(rawCliArgs));
     if (rawCliArgs.includes('--json')) {
       printErrorJson(err.message, hints);
       process.exit(1);
