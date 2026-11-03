@@ -74,6 +74,21 @@ describe('git runner', () => {
     expect(call?.[2]?.env?.GIT_SSH_COMMAND).toBe('ssh');
   });
 
+  test('expands github: shorthand before calling git ls-remote', async () => {
+    mockSpawnSuccess('abc123\tHEAD\n');
+
+    await expect(resolveGitRevision('github:owner/repo')).resolves.toBe(
+      'abc123',
+    );
+
+    expect(vi.mocked(spawn).mock.calls[0]?.[1]).toEqual([
+      'ls-remote',
+      '--',
+      'https://github.com/owner/repo.git',
+      'HEAD',
+    ]);
+  });
+
   test('rejects locators and refs that git would parse as options', async () => {
     mockSpawnSuccess('abc123\tHEAD\n');
 

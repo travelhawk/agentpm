@@ -196,11 +196,17 @@ export async function resolveGitRevision(
     return revision.trim();
   }
 
+  // `github:owner/repo` is AgentPM shorthand; git would read it as an SSH host.
+  const transportLocator = await toGitTransportLocator(locator);
+  assertSafeGitArgument(transportLocator, 'locator');
   const target = ref ?? 'HEAD';
-  const output = await runGitCommand(['ls-remote', '--', locator, target], {
-    env,
-    captureStdout: true,
-  });
+  const output = await runGitCommand(
+    ['ls-remote', '--', transportLocator, target],
+    {
+      env,
+      captureStdout: true,
+    },
+  );
   const firstLine = output.stdout
     .split('\n')
     .find((line) => line.trim().length > 0);
