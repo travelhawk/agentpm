@@ -718,13 +718,31 @@ function printInstalledProviderSkills(
   console.log('');
 }
 
+type InstallRecordView = ReturnType<AgentPmService['listInstalls']>[number];
+
+// Where an install's files come from, in words a user recognizes. The stored
+// path of a git install is a cache snapshot, which is an internal detail.
+function installOrigin(install: InstallRecordView): string {
+  if (install.metadata.library === true) {
+    return 'library';
+  }
+  if (install.contentKind === 'git') {
+    return install.contentLocator
+      .replace(/^https?:\/\//, '')
+      .replace(/^git@([^:]+):/, '$1/')
+      .replace(/\.git$/, '');
+  }
+  return install.contentLocator;
+}
+
 function summarizeInstalls(
-  installs: Awaited<ReturnType<AgentPmService['listInstalls']>>,
+  installs: InstallRecordView[],
 ): Array<{
   name: string;
   scope: string;
   scopeRoot: string;
   storedPath: string;
+  origin: string;
   adapters: string[];
   targetPaths: string[];
 }> {
@@ -735,6 +753,7 @@ function summarizeInstalls(
       scope: string;
       scopeRoot: string;
       storedPath: string;
+      origin: string;
       adapters: Set<string>;
       targetPaths: Set<string>;
     }
@@ -753,6 +772,7 @@ function summarizeInstalls(
       scope: install.scope,
       scopeRoot: install.scopeRoot,
       storedPath,
+      origin: installOrigin(install),
       adapters: new Set<string>(),
       targetPaths: new Set<string>(),
     };
@@ -767,6 +787,7 @@ function summarizeInstalls(
       scope: entry.scope,
       scopeRoot: entry.scopeRoot,
       storedPath: entry.storedPath,
+      origin: entry.origin,
       adapters: [...entry.adapters].sort(),
       targetPaths: [...entry.targetPaths].sort(),
     }))
@@ -1878,12 +1899,14 @@ program.command('list').option('--json', 'Print machine-readable JSON').action(a
     return;
   }
   for (const install of summaries) {
-    const targetsSuffix =
-      install.targetPaths.length > 1
-        ? ` ${style.gray(`(${install.targetPaths.length} targets)`)}` 
-        : '';
+    // Project and workspace installs from every folder are listed, so name
+    // the folder; otherwise two valid installs look like a duplicate.
+    const where =
+      install.scope === 'global'
+        ? 'global'
+        : `${install.scope} ${install.scopeRoot}`;
     console.log(
-      `${install.name}  ${install.scope}  ${install.storedPath}${targetsSuffix}`,
+      `${install.name}  ${style.gray(where)}  from ${install.origin}  ${style.gray(`(${install.adapters.join(', ')})`)}`,
     );
   }
 });

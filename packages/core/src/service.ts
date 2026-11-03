@@ -2240,6 +2240,56 @@ export class AgentPmService {
    * Resolve the workspace root and originating adapter for a native skill path
    * such as `<root>/.claude/skills/<name>` or `<root>/skills/<name>`.
    */
+  private findInstallForCachePath(cachePath: string): InstallRecord | null {
+    const owners = this.db
+      .listInstalls()
+      .filter(
+        (install) =>
+          path.resolve(install.linkTarget) === path.resolve(cachePath),
+      );
+    return (
+      owners.find((install) => isWithinDirectory(install.scopeRoot, this.cwd)) ??
+      owners[0] ??
+      null
+    );
+  }
+
+  /**
+   * Installs of the same skill in the same scope that do not use the library
+   * yet, other than the folder being adopted, and whether their files match
+   * the library copy.
+   */
+  private async classifySiblingInstalls(
+    name: string,
+    scopeRoot: string,
+    libraryPath: string,
+    libraryRevision: string,
+    adoptedPath: string,
+  ): Promise<Array<{ install: InstallRecord; matches: boolean; origin: string }>> {
+    const siblings = this.db
+      .listInstallsByName(name)
+      .filter(
+        (install) =>
+          path.resolve(install.scopeRoot) === path.resolve(scopeRoot) &&
+          path.resolve(install.linkTarget) !== path.resolve(libraryPath) &&
+          path.resolve(install.targetPath) !== path.resolve(adoptedPath),
+      );
+    const results = [];
+    for (const install of siblings) {
+      const signature = await computeTreeSignature(install.linkTarget).catch(
+        () => null,
+      );
+      results.push({
+        install,
+        matches: signature === libraryRevision,
+        origin:
+          this.db.getSource(install.sourceId)?.displayName ??
+          install.contentLocator,
+      });
+    }
+    return results;
+  }
+
   private resolveNativeScope(absPath: string): {
     scopeRoot: string;
     adapter: AdapterId;
@@ -2343,6 +2393,16 @@ export class AgentPmService {
         params.scopeRoot,
         adapter,
       );
+      // The target now points at the library, so an earlier install of the
+      // same path (for example from a git source) is replaced, not duplicated.
+      for (const previous of this.db.listInstallsByName(params.name)) {
+        if (
+          previous.id !== installId &&
+          path.resolve(previous.targetPath) === path.resolve(targetPath)
+        ) {
+          this.db.removeInstall(previous.id);
+        }
+      }
       const saved = this.db.saveInstall({
         id: installId,
         name: params.name,
@@ -2523,7 +2583,23 @@ export class AgentPmService {
 
     // Resolve the existing skill either from an explicit directory path or by
     // name within the current workspace.
-    const resolvedPath = path.resolve(this.cwd, token);
+    let resolvedPath = path.resolve(this.cwd, token);
+    if (isWithinDirectory(this.paths.cacheDir, resolvedPath)) {
+      // A cache path is AgentPM's own storage, not a place an agent reads
+      // from. Treating it as the origin would move files out of the cache and
+      // link agents into it, so adopt the install that uses it instead.
+      const owner = this.findInstallForCachePath(resolvedPath);
+      if (!owner) {
+        throw new AgentPmError(
+          `"${token}" is inside AgentPM's cache (${this.paths.cacheDir}), which AgentPM manages itself.\n` +
+            'Adopt the installed skill instead: pass its name, or the folder an agent reads it from, such as .claude/skills/<name>.',
+        );
+      }
+      warnings.push(
+        `"${token}" is inside AgentPM's cache, so AgentPM adopted the installed skill at ${owner.targetPath} instead.`,
+      );
+      resolvedPath = owner.targetPath;
+    }
     let name: string;
     let contentPath: string;
     let originAdapter: AdapterId | null;
@@ -2639,12 +2715,43 @@ export class AgentPmService {
       options.agents,
       options.yes ?? false,
     );
+    // Other agents' installs of this skill in the same scope move to the
+    // library too, so it stays one copy. A copy with different files is only
+    // replaced when its agent was named explicitly.
+    const siblings = await this.classifySiblingInstalls(
+      name,
+      effectiveScopeRoot,
+      libraryPath,
+      revision,
+      contentPath,
+    );
+    const explicitAgents = new Set(options.agents ?? []);
+    const keptApart = new Set<AdapterId>();
+    for (const { install, matches, origin } of siblings) {
+      if (matches) {
+        warnings.push(
+          `Moved the ${install.adapter} install of "${name}" to the library copy. It no longer updates from ${origin}.`,
+        );
+      } else if (explicitAgents.has(install.adapter)) {
+        warnings.push(
+          `Replaced the ${install.adapter} install of "${name}" with the library copy. Its previous copy from ${origin} had different files.`,
+        );
+      } else {
+        keptApart.add(install.adapter);
+        warnings.push(
+          `Left the ${install.adapter} install of "${name}" unchanged: it uses a different copy from ${origin}. Pass --target ${install.adapter} to replace it.`,
+        );
+      }
+    }
     const agents = Array.from(
       new Set<AdapterId>([
         ...(originAdapter ? [originAdapter] : []),
         ...requestedAgents,
+        ...siblings
+          .filter((sibling) => sibling.matches)
+          .map((sibling) => sibling.install.adapter),
       ]),
-    );
+    ).filter((agent) => !keptApart.has(agent));
 
     const installs = await this.linkSkillIntoAgents({
       name,
@@ -2940,6 +3047,18 @@ export class AgentPmService {
           message: `Install target is missing: ${install.targetPath}`,
           remedy: 'Reinstall or remove the missing install record.',
         });
+      } else if (isWithinDirectory(this.paths.cacheDir, install.scopeRoot)) {
+        // Older `adopt` runs could treat a cache checkout as a project and
+        // link agents into AgentPM's own storage.
+        issues.push({
+          severity: 'error',
+          code: 'install-in-cache',
+          installId: install.id,
+          path: install.targetPath,
+          message: `"${install.name}" is linked inside AgentPM's cache: ${install.targetPath}`,
+          remedy:
+            'Run `agentpm doctor --fix` to remove this link and its record. The skill itself is not touched.',
+        });
       } else if (await isBrokenLink(install.targetPath)) {
         issues.push({
           severity: 'error',
@@ -3026,7 +3145,10 @@ export class AgentPmService {
     const actions: DoctorFixAction[] = [];
 
     for (const issue of doctorIssues) {
-      if (issue.code === 'install-missing' && issue.installId) {
+      if (
+        (issue.code === 'install-missing' || issue.code === 'install-in-cache') &&
+        issue.installId
+      ) {
         const install = this.db.getInstall(issue.installId);
         if (!install) {
           continue;
@@ -3034,7 +3156,10 @@ export class AgentPmService {
         actions.push({
           code: 'remove-install-record',
           installId: install.id,
-          description: `Removing stale install record: ${install.name} (${install.targetPath})`,
+          description:
+            issue.code === 'install-in-cache'
+              ? `Removing install linked inside the cache: ${install.name} (${install.targetPath})`
+              : `Removing stale install record: ${install.name} (${install.targetPath})`,
         });
         continue;
       }
@@ -3088,6 +3213,14 @@ export class AgentPmService {
         if (!install) {
           results.push({ action, applied: false });
           continue;
+        }
+        // Only unlink: a real folder inside the cache is cache content.
+        const target = await fs.lstat(install.targetPath).catch(() => null);
+        if (
+          target?.isSymbolicLink() &&
+          isWithinDirectory(this.paths.cacheDir, install.scopeRoot)
+        ) {
+          await removeManagedLink(install.targetPath);
         }
         this.db.removeInstall(install.id);
         results.push({ action, applied: true });

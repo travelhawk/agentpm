@@ -812,8 +812,9 @@ describe('update and cli flows', () => {
         .split(/\r?\n/)
         .filter((line) => line.includes('implementation-workflow'));
       expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain(path.join(homeDir, 'skills', 'implementation-workflow'));
-      expect(lines[0]).toContain('(3 targets)');
+      expect(lines[0]).toContain(`project ${projectDir}`);
+      expect(lines[0]).toContain('from library');
+      expect(lines[0]).toContain('(claude, codex, generic)');
     },
     CI_TEST_TIMEOUT,
   );
