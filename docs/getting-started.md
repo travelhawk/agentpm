@@ -156,7 +156,8 @@ Typical fixes:
 - no sources configured: `agentpm source add <repo-or-registry>`
 - wrong source token: inspect `agentpm source list`
 - removing a source that skills came from: `agentpm source remove <source>` asks whether to keep or remove those skills; pass `--keep-installs` or `--remove-installs` to skip the question
-- non-interactive execution: pass `--skill`, `--all`, `--from`, or `--yes`
+- non-interactive execution: when a command needs a choice, the error lists the flags that answer it (for example `--project`, `--skill`, `--all`, or `--yes`)
+- leaving out the name in `agentpm remove`, `agentpm source remove`, `agentpm target default`, or `agentpm target remove` shows a list to choose from
 - repo contract issues: run `agentpm init` if the repo should own the contract
 
 ## Validation

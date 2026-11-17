@@ -113,6 +113,22 @@ import {
   type RemoveSourceResult,
   type SourceInstallsAction,
 } from './source-removal.js';
+import {
+  pickInstallToRemove,
+  pickSourceToRemove,
+  pickTargetId,
+} from './argument-pickers.js';
+import {
+  UPDATE_NEEDS_CONFIRMATION_WARNING,
+  agentChoiceRequiredMessage,
+  describeNames,
+  installAllSourceRequiredMessage,
+  installNameRequiredMessage,
+  pushEntriesChoiceRequiredMessage,
+  scopeChoiceRequiredMessage,
+  sourceRequiredMessage,
+} from './choice-guidance.js';
+import { canPrompt } from './prompt-guard.js';
 
 export type {
   RemoveSourceOptions,
@@ -396,9 +412,9 @@ export class AgentPmService {
           'No sources have been added yet. Use "agentpm source add <locator>" first.',
         );
       }
-      if (!this.prompts.selectOne) {
+      if (!canPrompt(this.prompts, 'selectOne')) {
         throw new AgentPmError(
-          'Listing source skills without a source requires an interactive TTY.',
+          sourceRequiredMessage('agentpm source skills', sources),
         );
       }
       source = await this.prompts.selectOne(
@@ -539,11 +555,13 @@ export class AgentPmService {
   }
 
   async removeSource(
-    sourceToken: string,
+    sourceToken: string | undefined,
     options: RemoveSourceOptions = {},
   ): Promise<RemoveSourceResult> {
     await this.initialize();
-    const source = this.findSourceByToken(sourceToken);
+    const source = sourceToken
+      ? this.findSourceByToken(sourceToken)
+      : await pickSourceToRemove(this.prompts, this.listSources());
     if (!source) {
       throw new AgentPmError(`Unknown source: ${sourceToken}`);
     }
@@ -587,7 +605,7 @@ export class AgentPmService {
     // folder means the skills are already broken.
     const sourceContentMissing =
       source.kind === 'local' && !(await pathExists(source.locator));
-    if (!this.prompts.selectOne || this.prompts.isInteractive?.() === false) {
+    if (!canPrompt(this.prompts, 'selectOne')) {
       throw new AgentPmError(
         sourceInstallsChoiceRequiredMessage(source, installs, sourceContentMissing),
       );
@@ -703,9 +721,12 @@ export class AgentPmService {
           `No public skills found for "${resolved.query}".`,
         );
       }
-      if (!this.prompts.selectOne) {
+      if (!canPrompt(this.prompts, 'selectOne')) {
         throw new AgentPmError(
-          `Query installs require an interactive TTY. Re-run interactively or install with a concrete selector like "${results[0]!.skillSelector}".`,
+          `"${resolved.query}" is a search, not a skill name. Install one result by its full name, e.g. agentpm skills install ${results[0]!.skillSelector}\nResults: ${results
+            .slice(0, 5)
+            .map((result) => result.skillSelector)
+            .join(', ')}`,
         );
       }
       const selected = await this.prompts.selectOne(
@@ -1036,7 +1057,7 @@ export class AgentPmService {
       .map((entry) => `  - ${this.describeInstallCandidate(entry)}`)
       .join('\n');
 
-    if (!options.yes && this.prompts.selectOne) {
+    if (!options.yes && canPrompt(this.prompts, 'selectOne')) {
       return this.prompts.selectOne(
         `"${name}" matches more than one entry. Which do you want to install?`,
         unique.map((entry) => ({
@@ -1146,7 +1167,11 @@ export class AgentPmService {
         (preview.risk === 'remap' || preview.risk === 'breaking') &&
         !options.yes
       ) {
-        const confirmed = await this.prompts.confirm?.(
+        if (!canPrompt(this.prompts, 'confirm')) {
+          preview.warnings.push(UPDATE_NEEDS_CONFIRMATION_WARNING);
+          continue;
+        }
+        const confirmed = await this.prompts.confirm(
           `Update ${preview.install.name} with ${preview.risk} layout risk?`,
           preview.warnings,
         );
@@ -1270,16 +1295,28 @@ export class AgentPmService {
   }
 
   async removeInstall(
-    name: string,
+    name: string | undefined,
     options: RemoveInstallOptions = {},
   ): Promise<InstallRecord> {
     await this.initialize();
+    if (!name) {
+      const install = await pickInstallToRemove(
+        this.prompts,
+        this.filterRemoveCandidates(this.listInstalls(), options),
+      );
+      return this.removeInstallRecord(install, options);
+    }
     const installs = this.filterRemoveCandidates(
       this.db.listInstallsByName(name),
       options,
     );
     if (installs.length === 0) {
-      throw new AgentPmError(`No install named "${name}" found.`);
+      const installed = this.listInstalls().map((install) => install.name);
+      throw new AgentPmError(
+        installed.length > 0
+          ? `No install named "${name}" found. Installed: ${describeNames(installed)}.`
+          : `No install named "${name}" found. No skills are installed yet.`,
+      );
     }
 
     // Install names are only unique per scope root, so the same skill installed
@@ -1306,7 +1343,7 @@ export class AgentPmService {
       }
       // Without a usable picker, say what matched and which flags narrow it
       // down, instead of letting the prompt fail with a bare "requires a TTY".
-      if (!this.prompts.selectOne || this.prompts.isInteractive?.() === false) {
+      if (!canPrompt(this.prompts, 'selectOne')) {
         throw new AgentPmError(
           `Multiple installs named "${name}" found. Re-run with --target, --scope, or --path to choose one.\n\nMatches:\n${available}`,
         );
@@ -1482,16 +1519,34 @@ export class AgentPmService {
     );
   }
 
-  async setDefaultTarget(id: string): Promise<void> {
+  /** Returns the target id, which is asked for when `id` is left out. */
+  async setDefaultTarget(id?: string): Promise<string> {
     await this.initialize();
     const { setDefaultGlobalTarget } = await import('@agentpm/config');
-    await setDefaultGlobalTarget(this.cwd, id, this.env);
+    const globalConfig = await loadGlobalConfig(this.cwd, this.env);
+    const targetId = await pickTargetId(
+      this.prompts,
+      globalConfig.targets ?? [],
+      id,
+      'default',
+    );
+    await setDefaultGlobalTarget(this.cwd, targetId, this.env);
+    return targetId;
   }
 
-  async removeTarget(id: string): Promise<void> {
+  /** Returns the target id, which is asked for when `id` is left out. */
+  async removeTarget(id?: string): Promise<string> {
     await this.initialize();
     const { removeTargetFromGlobalConfig } = await import('@agentpm/config');
-    await removeTargetFromGlobalConfig(this.cwd, id, this.env);
+    const globalConfig = await loadGlobalConfig(this.cwd, this.env);
+    const targetId = await pickTargetId(
+      this.prompts,
+      globalConfig.targets ?? [],
+      id,
+      'remove',
+    );
+    await removeTargetFromGlobalConfig(this.cwd, targetId, this.env);
+    return targetId;
   }
 
   async push(options: PushOptions = {}): Promise<PushResult> {
@@ -1532,6 +1587,7 @@ export class AgentPmService {
   private async resolvePushTarget(
     token: string | undefined,
     config: LoadedProjectConfig | null,
+    targetFlag: '--to' | '--from' = '--to',
   ): Promise<ManifestPushTargetSpec> {
     const { loadGlobalConfig } = await import('@agentpm/config');
     const globalConfig = await loadGlobalConfig(this.cwd, this.env);
@@ -1562,7 +1618,7 @@ export class AgentPmService {
       return targets[0]!;
     }
 
-    if (targets.length > 1 && this.prompts.selectOne) {
+    if (targets.length > 1 && canPrompt(this.prompts, 'selectOne')) {
       const selected = await this.prompts.selectOne(
         'Choose a push target:',
         targets.map((target) => ({
@@ -1571,7 +1627,7 @@ export class AgentPmService {
           description: `${target.kind ?? 'git'}  ${target.locator}`,
         })),
       );
-      if (selected.id && this.prompts.confirm) {
+      if (selected.id && canPrompt(this.prompts, 'confirm')) {
         const shouldSaveDefault = await this.prompts.confirm(
           `Save "${selected.id}" as the default push target?`,
           ['The default will be written to global AgentPM config.'],
@@ -1583,21 +1639,28 @@ export class AgentPmService {
       return selected;
     }
 
-    const available =
-      targets.length > 0
-        ? targets
-            .map(
-              (target) =>
-                `  - ${target.id ?? target.locator} (${target.kind ?? 'git'}) ${target.locator}`,
-            )
-            .join('\n')
-        : '  - none configured';
+    const legacyNote =
+      legacyProjectTargets.length > 0
+        ? '\n\nLegacy project targets were found in agentpm.yaml but are no longer used for push target resolution.'
+        : '';
+    if (targets.length === 0) {
+      throw new AgentPmError(
+        'No push target is set up yet. Add one first:\n' +
+          '  agentpm target add <git-url> --default\n' +
+          `Or name it for this run only: ${targetFlag} <git-url>` +
+          legacyNote,
+      );
+    }
+    const available = targets
+      .map(
+        (target) =>
+          `  - ${target.id ?? target.locator} (${target.kind ?? 'git'}) ${target.locator}`,
+      )
+      .join('\n');
     throw new AgentPmError(
-      `No push target specified and no default target configured in global config.` +
-        (legacyProjectTargets.length > 0
-          ? '\n\nLegacy project targets were found in agentpm.yaml but are no longer used for push target resolution.'
-          : '') +
-        `\n\nAvailable targets:\n${available}\n\nUse --to <target>, or set one with: agentpm target default <id>`,
+      `Choose a target with ${targetFlag} <id>, or set a default with: agentpm target default <id>` +
+        `\n\nAvailable targets:\n${available}` +
+        legacyNote,
     );
   }
 
@@ -1920,7 +1983,7 @@ export class AgentPmService {
       return workspaceCandidates;
     }
 
-    if (this.prompts.selectMany) {
+    if (canPrompt(this.prompts, 'selectMany')) {
       const selected = await this.prompts.selectMany(
         'Choose skills or agents to push:',
         workspaceCandidates.map((candidate) => ({
@@ -1942,9 +2005,7 @@ export class AgentPmService {
           `  - ${candidate.name} -> ${candidate.destinationRelativePath}`,
       )
       .join('\n');
-    throw new AgentPmError(
-      `Multiple pushable entries were detected. Re-run interactively, or pass a skill name or path.\n\nAvailable entries:\n${available}`,
-    );
+    throw new AgentPmError(pushEntriesChoiceRequiredMessage(available));
   }
 
   private async choosePushCandidates(
@@ -1955,7 +2016,7 @@ export class AgentPmService {
       return matches;
     }
 
-    if (!this.prompts.selectOne) {
+    if (!canPrompt(this.prompts, 'selectOne')) {
       const available = matches
         .map(
           (candidate) =>
@@ -2280,6 +2341,9 @@ export class AgentPmService {
     if (yes || !this.prompts.selectMany || candidates.length === 1) {
       return candidates;
     }
+    if (!canPrompt(this.prompts, 'selectMany')) {
+      throw new AgentPmError(agentChoiceRequiredMessage(candidates));
+    }
 
     const selected = await this.prompts.selectMany<AdapterId>(
       'Select agents to install these skills into:',
@@ -2420,7 +2484,7 @@ export class AgentPmService {
       const existing = await fs.lstat(targetPath).catch(() => null);
       if (existing && !existing.isSymbolicLink()) {
         let replace = false;
-        if (!params.yes && this.prompts.confirm) {
+        if (!params.yes && canPrompt(this.prompts, 'confirm')) {
           replace = await this.prompts.confirm(
             `"${targetPath}" already exists and is not managed by AgentPM. Replace it with a link to the library copy?`,
             ['The existing files at that path will be removed.'],
@@ -2495,7 +2559,7 @@ export class AgentPmService {
   async pull(options: PullOptions = {}): Promise<PullResult> {
     await this.initialize();
     const loadedConfig = await loadProjectConfig(this.cwd);
-    const target = await this.resolvePushTarget(options.target, loadedConfig);
+    const target = await this.resolvePushTarget(options.target, loadedConfig, '--from');
     if (target.kind === 'registry') {
       throw new AgentPmError(
         'Pulling from a registry target is not supported.',
@@ -2726,21 +2790,29 @@ export class AgentPmService {
           computeTreeSignature(libraryPath),
         ]);
         if (originRevision !== libraryRevision) {
-          const message =
-            `A different skill named "${name}" already exists in the AgentPM library. ` +
-            'Aborting before replacing the local skill with the library copy.';
-          if (!options.yes && this.prompts.confirm) {
-            const shouldReplace = await this.prompts.confirm(message, [
-              `Library: ${libraryPath}`,
-              `Local: ${contentPath}`,
-            ]);
+          const conflict = `A different skill named "${name}" already exists in the AgentPM library.`;
+          // --yes does not answer this one: replacing the local copy loses
+          // its changes, so only an explicit answer in a terminal does.
+          if (!options.yes && canPrompt(this.prompts, 'confirm')) {
+            const shouldReplace = await this.prompts.confirm(
+              `${conflict} Replace your local copy with the library copy?`,
+              [`Library: ${libraryPath}`, `Local: ${contentPath}`],
+            );
             if (!shouldReplace) {
               throw new AgentPmError(
                 `Adopt cancelled because "${name}" already exists in the library with different contents.`,
               );
             }
           } else {
-            throw new AgentPmError(message);
+            throw new AgentPmError(
+              [
+                `${conflict} Nothing was changed.`,
+                `  Library copy: ${libraryPath}`,
+                `  Local copy:   ${contentPath}`,
+                'To use the library copy, run the command in a terminal and confirm.',
+                'To keep your local copy, rename its folder, or delete the library copy first.',
+              ].join('\n'),
+            );
           }
         } else {
           warnings.push(
@@ -3816,7 +3888,7 @@ export class AgentPmService {
     let shouldAdd = false;
     if (yesOption) {
       shouldAdd = true;
-    } else if (this.prompts.confirm) {
+    } else if (canPrompt(this.prompts, 'confirm')) {
       shouldAdd = await this.prompts.confirm(
         `Would you like to add "${firstSegment}/" to your .gitignore?`,
         [
@@ -3931,7 +4003,7 @@ export class AgentPmService {
     this.reportStatus(
       `Resolving one-off source ${displayNameFromLocator(normalizedLocator)}...`,
     );
-    if (!skipConfirmation && this.prompts.confirm) {
+    if (!skipConfirmation && canPrompt(this.prompts, 'confirm')) {
       const shouldAdd = await this.prompts.confirm(
         'Add this repo as a permanent AgentPM source?',
         [normalizedLocator],
@@ -4203,7 +4275,7 @@ export class AgentPmService {
         return [{ source: forcedSource, entry: entries[0]! }];
       }
 
-      if (this.prompts.selectMany) {
+      if (canPrompt(this.prompts, 'selectMany')) {
         const selected = await this.prompts.selectMany(
           `Choose skills to install from ${forcedSource.displayName}:`,
           entries.map((entry) => ({
@@ -4222,7 +4294,7 @@ export class AgentPmService {
         .map((entry) => `  - ${entry.name} (${entry.path ?? entry.repo})`)
         .join('\n');
       throw new AgentPmError(
-        `Multiple installable entries were found in source ${forcedSource.displayName}. Re-run interactively, pass --skill <name>, or use --all.\n\nAvailable entries:\n${available}`,
+        `Source ${forcedSource.displayName} has more than one skill. Choose with one of these flags:\n  --skill <name>  install one skill (repeat for more)\n  --all           install all of them\n\nAvailable entries:\n${available}`,
       );
     }
 
@@ -4237,10 +4309,8 @@ export class AgentPmService {
       const sourceToken = names[0];
       let source = sourceToken ? this.findSourceByToken(sourceToken) : null;
       if (!source) {
-        if (!this.prompts.selectOne) {
-          throw new AgentPmError(
-            'Installing all entries requires a source argument or an interactive TTY.',
-          );
+        if (!canPrompt(this.prompts, 'selectOne')) {
+          throw new AgentPmError(installAllSourceRequiredMessage(sources));
         }
         source = await this.prompts.selectOne(
           'Choose a source to install from:',
@@ -4295,16 +4365,15 @@ export class AgentPmService {
     }
 
     if (requestedNames.length === 0) {
-      if (!this.prompts.selectOne) {
-        throw new AgentPmError(
-          'No install target supplied. Re-run interactively or provide a skill name.',
-        );
-      }
-
       const allEntries = this.db.listCatalogEntries();
       if (allEntries.length === 0) {
         throw new AgentPmError(
           'No catalog entries are indexed yet. Add a source first.',
+        );
+      }
+      if (!canPrompt(this.prompts, 'selectOne')) {
+        throw new AgentPmError(
+          installNameRequiredMessage(allEntries.map((entry) => entry.name)),
         );
       }
 
@@ -4385,7 +4454,7 @@ export class AgentPmService {
       return `${kind} · ${agent}`;
     };
 
-    if (!options.yes && this.prompts.selectOne) {
+    if (!options.yes && canPrompt(this.prompts, 'selectOne')) {
       return this.prompts.selectOne(
         `"${requestedName}" matches more than one entry. Which do you want to install?`,
         matches.map((candidate) => {
@@ -4453,23 +4522,26 @@ export class AgentPmService {
       return scope;
     }
 
-    if (this.prompts.selectOne) {
-      return this.prompts.selectOne('Choose an install scope:', [
-        { label: 'Project', description: this.cwd, value: 'project' as const },
-        {
-          label: 'Global',
-          description: 'Install into your home directory native target',
-          value: 'global' as const,
-        },
-        {
-          label: 'Workspace',
-          description: 'Install into a workspace root',
-          value: 'workspace' as const,
-        },
-      ]);
+    // Without any prompt API (library use), keep the old project default.
+    if (!this.prompts.selectOne) {
+      return 'project';
     }
-
-    return 'project';
+    if (!canPrompt(this.prompts, 'selectOne')) {
+      throw new AgentPmError(scopeChoiceRequiredMessage(this.cwd));
+    }
+    return this.prompts.selectOne('Choose an install scope:', [
+      { label: 'Project', description: this.cwd, value: 'project' as const },
+      {
+        label: 'Global',
+        description: 'Install into your home directory native target',
+        value: 'global' as const,
+      },
+      {
+        label: 'Workspace',
+        description: 'Install into a workspace root',
+        value: 'workspace' as const,
+      },
+    ]);
   }
 
   private async prepareContentForEntry(
@@ -4717,7 +4789,7 @@ export class AgentPmService {
       Boolean(options.adapter) ||
       Boolean(options.scope) ||
       Boolean(options.targetPath);
-    if (!this.prompts.selectOne) {
+    if (!canPrompt(this.prompts, 'selectOne')) {
       throw new AgentPmError(
         `Multiple skills.sh installs match "${identifier}". Re-run with --target, --scope, or --path to choose one.\n\nMatches:\n${available}`,
       );
