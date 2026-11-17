@@ -345,6 +345,20 @@ function resolveScope(flags: {
   return undefined;
 }
 
+function resolveTargets(value?: string): InstallOptions['targets'] {
+  if (!value) {
+    return undefined;
+  }
+  const parts = value
+    .split(',')
+    .map((part) => part.trim().toLowerCase())
+    .filter(Boolean);
+  if (parts.includes('all')) {
+    return ['claude', 'codex', 'generic'];
+  }
+  return [...new Set(parts.map((part) => resolveTarget(part)!))];
+}
+
 function resolveTarget(value?: string): InstallOptions['target'] {
   if (!value) {
     return undefined;
@@ -1563,7 +1577,7 @@ addExamples(
     .option('--ref <ref>', 'Git branch, tag, or revision')
     .option(
       '--target <target>',
-      'Install only entries for codex, claude, or generic',
+      'Agents to install for: codex, claude, generic (comma separated) or all. A skill is linked into each agent skill folder',
     )
     .option(
       '--kind <kind>',
@@ -1596,7 +1610,7 @@ addExamples(
             all: flags.all,
             skills: flags.skill,
             ref: flags.ref ?? null,
-            target: resolveTarget(flags.target),
+            targets: resolveTargets(flags.target),
             kind: resolveKind(flags.kind),
             from: flags.from,
             addSource: flags.addSource,
@@ -1621,6 +1635,7 @@ addExamples(
     'agentpm install release-helper --project',
     'agentpm install --from travelhawk/skills-vault --skill release-helper --project',
     'agentpm install --from github:company/private-skills --all --target codex',
+    'agentpm install --from company/skills --skill release-helper --global --target claude,codex,generic',
   ],
 );
 

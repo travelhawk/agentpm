@@ -136,6 +136,12 @@ import {
   scopeChoiceRequiredMessage,
   sourceRequiredMessage,
 } from './choice-guidance.js';
+import {
+  installAdaptersFor,
+  matchesCatalogEntryTargets,
+  requestedTargets,
+  selectEntriesForTargets,
+} from './install-targets.js';
 import { canPrompt } from './prompt-guard.js';
 
 export type {
@@ -158,6 +164,8 @@ export interface InstallOptions {
   ref?: string | null | undefined;
   revision?: string | null | undefined;
   target?: AdapterId | undefined;
+  /** Install for several agents at once; takes precedence over `target`. */
+  targets?: AdapterId[] | undefined;
   kind?: EntryKind | undefined;
   from?: string | undefined;
   addSource?: boolean | undefined;
@@ -306,9 +314,12 @@ function matchesCatalogEntrySelector(
 
 function matchesCatalogEntryTarget(
   entry: CatalogEntryRecord,
-  target?: AdapterId,
+  target?: AdapterId | AdapterId[],
 ): boolean {
-  return !target || entry.adapterHint === null || entry.adapterHint === target;
+  return matchesCatalogEntryTargets(
+    entry,
+    Array.isArray(target) ? target : target ? [target] : [],
+  );
 }
 
 export class AgentPmService {
@@ -836,6 +847,7 @@ export class AgentPmService {
       options.workspaceRoot,
     );
     const selections = await this.resolveSelections(names, options);
+    const targets = requestedTargets(options);
     const installs: InstallRecord[] = [];
 
     for (const selection of selections) {
@@ -859,26 +871,36 @@ export class AgentPmService {
         if (selection.entry.path) {
           selector.relativePath = selection.entry.path;
         }
-        const detectedEntries = listInstallableEntries(prepared.report).filter(
-          (entry) =>
-            (!options.target || entry.adapter === options.target) &&
-            (!options.kind || entry.kind === options.kind),
+        const byKind = listInstallableEntries(prepared.report).filter(
+          (entry) => !options.kind || entry.kind === options.kind,
+        );
+        let detectedEntries = byKind.filter(
+          (entry) => targets.length === 0 || targets.includes(entry.adapter),
         );
 
         // Collect every entry that matches the requested selector, then resolve
         // to one. When a name resolves to several distinct entries — e.g. a
         // skill and a plugin, or the same name for two agents — offer a choice
         // instead of silently picking the first.
-        const candidates = this.collectInstallCandidates(
+        let candidates = this.collectInstallCandidates(
           detectedEntries,
           selector,
           selection.entry.name,
         );
+        if (candidates.length === 0 && targets.length > 0) {
+          // The skill sits in another layout (for example plain `skills/`).
+          // A skill can still be installed for every requested agent.
+          detectedEntries = byKind.filter((entry) => entry.kind === 'skill');
+          candidates = this.collectInstallCandidates(
+            detectedEntries,
+            selector,
+            selection.entry.name,
+          );
+        }
 
         if (candidates.length === 0) {
-          const targetSummary = options.target
-            ? ` for target "${options.target}"`
-            : '';
+          const targetSummary =
+            targets.length > 0 ? ` for target "${targets.join(', ')}"` : '';
           const kindSummary = options.kind ? ` of kind "${options.kind}"` : '';
           const availableNames = detectedEntries
             .slice(0, 20)
@@ -902,90 +924,94 @@ export class AgentPmService {
           options,
         );
 
-        const adapter = getAdapter(detectedEntry.adapter);
-        const mapping = await adapter.install(detectedEntry, scopeRoot);
-        const linkTarget = path.join(
-          prepared.repoRoot,
-          mapping.sourceRelativePath,
-        );
-        const targetPath = path.join(scopeRoot, mapping.targetRelativePath);
+        // A skill is linked into the native folder of every requested agent.
+        // All links point at the same checkout, so one update refreshes them.
+        for (const adapterId of installAdaptersFor(detectedEntry, targets)) {
+          const adapter = getAdapter(adapterId);
+          const mapping = await adapter.install(detectedEntry, scopeRoot);
+          const linkTarget = path.join(
+            prepared.repoRoot,
+            mapping.sourceRelativePath,
+          );
+          const targetPath = path.join(scopeRoot, mapping.targetRelativePath);
 
-        await ensureDir(path.dirname(targetPath));
-        await this.relinkManagedContent(targetPath, linkTarget);
+          await ensureDir(path.dirname(targetPath));
+          await this.relinkManagedContent(targetPath, linkTarget);
 
-        const installedRevision =
-          prepared.revision ??
-          (prepared.contentKind === 'local'
-            ? await computeTreeSignature(
-                path.join(prepared.repoRoot, mapping.sourceRelativePath),
-              )
-            : null);
+          const installedRevision =
+            prepared.revision ??
+            (prepared.contentKind === 'local'
+              ? await computeTreeSignature(
+                  path.join(prepared.repoRoot, mapping.sourceRelativePath),
+                )
+              : null);
 
-        // The adapter is part of the identity so the same skill/plugin name can
-        // be installed for two agents (e.g. codex and claude) from one source
-        // without the second install overwriting the first record.
-        const installId = makeId(
-          'inst',
-          selection.source.id,
-          mapping.name,
-          scope,
-          scopeRoot,
-          mapping.adapter,
-        );
-        const savedInstall = this.db.saveInstall({
-          id: installId,
-          name: mapping.name,
-          sourceId: selection.source.id,
-          catalogEntryId: selection.entry.id,
-          adapter: mapping.adapter,
-          scope,
-          scopeRoot,
-          targetPath,
-          linkTarget,
-          sourceRelativePath: mapping.sourceRelativePath,
-          sourceRootRelativePath: mapping.sourceRootRelativePath,
-          selectedItems:
-            options.skills && options.skills.length > 0
-              ? options.skills
-              : [mapping.name],
-          contentKind: prepared.contentKind,
-          contentLocator: prepared.contentLocator,
-          contentRef: options.ref ?? selection.entry.ref ?? null,
-          cacheKey: prepared.cacheKey,
-          installedRevision,
-          layoutSignature: prepared.report.layoutSignature,
-          metadata: {
-            sourceLocator: selection.source.locator,
-            sourceKind: selection.source.kind,
-            ...(prepared.archive
-              ? { archive: true, archiveVersion: prepared.archive.version }
-              : {}),
-          },
-          createdAt: nowIso(),
-          updatedAt: nowIso(),
-        });
-
-        await this.recordGeneratedTargetInLocalGitExclude(savedInstall);
-        await this.ensureGitignored(scopeRoot, targetPath, options.yes);
-        installs.push(savedInstall);
-
-        if (detectedEntry.kind === 'plugin') {
-          const marketplaceName = await this.syncPluginMarketplace(
+          // The adapter is part of the identity so the same skill/plugin name can
+          // be installed for two agents (e.g. codex and claude) from one source
+          // without the second install overwriting the first record.
+          const installId = makeId(
+            'inst',
+            selection.source.id,
+            mapping.name,
+            scope,
             scopeRoot,
             mapping.adapter,
           );
-          const pluginRoot = path.join(
+          const savedInstall = this.db.saveInstall({
+            id: installId,
+            name: mapping.name,
+            sourceId: selection.source.id,
+            catalogEntryId: selection.entry.id,
+            adapter: mapping.adapter,
+            scope,
             scopeRoot,
-            nativePluginRoot(mapping.adapter),
-          );
-          const cli = mapping.adapter === 'codex' ? 'codex' : 'claude';
-          const installVerb =
-            mapping.adapter === 'codex' ? 'add' : 'install';
-          this.reportStatus(
-            `Plugin ready. Enable it in ${cli === 'codex' ? 'Codex' : 'Claude Code'}:\n` +
-              `  ${cli} plugin marketplace add ${pluginRoot}\n` +
-              `  ${cli} plugin ${installVerb} ${mapping.name}@${marketplaceName}`,
-          );
+            targetPath,
+            linkTarget,
+            sourceRelativePath: mapping.sourceRelativePath,
+            sourceRootRelativePath: mapping.sourceRootRelativePath,
+            selectedItems:
+              options.skills && options.skills.length > 0
+                ? options.skills
+                : [mapping.name],
+            contentKind: prepared.contentKind,
+            contentLocator: prepared.contentLocator,
+            contentRef: options.ref ?? selection.entry.ref ?? null,
+            cacheKey: prepared.cacheKey,
+            installedRevision,
+            layoutSignature: prepared.report.layoutSignature,
+            metadata: {
+              sourceLocator: selection.source.locator,
+              sourceKind: selection.source.kind,
+              ...(prepared.archive
+                ? { archive: true, archiveVersion: prepared.archive.version }
+                : {}),
+            },
+            createdAt: nowIso(),
+            updatedAt: nowIso(),
+          });
+
+          await this.recordGeneratedTargetInLocalGitExclude(savedInstall);
+          await this.ensureGitignored(scopeRoot, targetPath, options.yes);
+          installs.push(savedInstall);
+
+          if (detectedEntry.kind === 'plugin') {
+            const marketplaceName = await this.syncPluginMarketplace(
+              scopeRoot,
+              mapping.adapter,
+            );
+            const pluginRoot = path.join(
+              scopeRoot,
+              nativePluginRoot(mapping.adapter),
+            );
+            const cli = mapping.adapter === 'codex' ? 'codex' : 'claude';
+            const installVerb =
+              mapping.adapter === 'codex' ? 'add' : 'install';
+            this.reportStatus(
+              `Plugin ready. Enable it in ${cli === 'codex' ? 'Codex' : 'Claude Code'}:\n` +
+                `  ${cli} plugin marketplace add ${pluginRoot}\n` +
+                `  ${cli} plugin ${installVerb} ${mapping.name}@${marketplaceName}`,
+            );
+          }
         }
       } finally {
         await prepared.cleanup?.();
@@ -4379,18 +4405,21 @@ export class AgentPmService {
         )
       : null;
     const forcedSource = forcedInstallSource?.source ?? null;
+    const targets = requestedTargets(options);
     const requestedNames =
       options.skills && options.skills.length > 0 ? options.skills : names;
 
     if (forcedSource) {
-      const entries = (
+      const entries = selectEntriesForTargets(
         forcedInstallSource?.persisted
           ? this.db.listCatalogEntriesBySource(forcedSource.id)
-          : (forcedInstallSource?.entries ?? [])
-      ).filter((entry) => matchesCatalogEntryTarget(entry, options.target));
+          : (forcedInstallSource?.entries ?? []),
+        targets,
+      );
 
       if (entries.length === 0) {
-        const targetSummary = options.target ? ` for ${options.target}` : '';
+        const targetSummary =
+          targets.length > 0 ? ` for ${targets.join(', ')}` : '';
         throw new AgentPmError(
           `No installable entries${targetSummary} were found in source ${forcedSource.displayName}. Run "agentpm source skills ${forcedSource.id}" or "agentpm inspect ${forcedSource.locator}" for details.`,
         );
@@ -4405,7 +4434,7 @@ export class AgentPmService {
             ),
         );
         if (filtered.length === 0) {
-          const targetSummary = options.target ? ` for ${options.target}` : '';
+          const targetSummary = targets.length > 0 ? ` for ${targets.join(", ")}` : '';
           throw new AgentPmError(
             `No requested skills${targetSummary} were found in source ${forcedSource.displayName}.`,
           );
@@ -4418,7 +4447,7 @@ export class AgentPmService {
           forcedSource,
           entries,
           requestedNames,
-          options.target,
+          targets,
           options.kind,
         );
       }
@@ -4474,17 +4503,19 @@ export class AgentPmService {
         );
       }
 
-      const entries = this.db
-        .listCatalogEntriesBySource(source.id)
-        .filter(
-          (entry) =>
-            (!options.skills ||
+      const entries = selectEntriesForTargets(
+        this.db
+          .listCatalogEntriesBySource(source.id)
+          .filter(
+            (entry) =>
+              !options.skills ||
               options.skills.length === 0 ||
               options.skills.some((skillSelector) =>
                 matchesCatalogEntrySelector(entry, skillSelector),
-              )) &&
-            matchesCatalogEntryTarget(entry, options.target),
-        );
+              ),
+          ),
+        targets,
+      );
       if (entries.length === 0) {
         throw new AgentPmError(
           `No installable entries found for source ${source.displayName}.`,
@@ -4496,18 +4527,20 @@ export class AgentPmService {
     if (names.length === 1 && options.skills && options.skills.length > 0) {
       const source = this.findSourceByToken(names[0]!);
       if (source) {
-        const entries = this.db
-          .listCatalogEntriesBySource(source.id)
-          .filter(
-            (entry) =>
+        const entries = selectEntriesForTargets(
+          this.db
+            .listCatalogEntriesBySource(source.id)
+            .filter((entry) =>
               Boolean(
                 options.skills?.some((skillSelector) =>
                   matchesCatalogEntrySelector(entry, skillSelector),
                 ),
-              ) && matchesCatalogEntryTarget(entry, options.target),
-          );
+              ),
+            ),
+          targets,
+        );
         if (entries.length === 0) {
-          const targetSummary = options.target ? ` for ${options.target}` : '';
+          const targetSummary = targets.length > 0 ? ` for ${targets.join(", ")}` : '';
           throw new AgentPmError(
             `No requested skills${targetSummary} were found in source ${source.displayName}.`,
           );
@@ -4556,18 +4589,19 @@ export class AgentPmService {
       entry: CatalogEntryRecord;
     }> = [];
     for (const requestedName of requestedNames) {
-      const matches = this.db
-        .listCatalogEntries()
-        .filter(
-          (entry) =>
-            matchesCatalogEntrySelector(entry, requestedName) &&
-            matchesCatalogEntryTarget(entry, options.target) &&
-            (!options.kind || this.catalogEntryKind(entry) === options.kind),
-        );
+      const matches = selectEntriesForTargets(
+        this.db
+          .listCatalogEntries()
+          .filter(
+            (entry) =>
+              matchesCatalogEntrySelector(entry, requestedName) &&
+              (!options.kind || this.catalogEntryKind(entry) === options.kind),
+          ),
+        targets,
+      );
       if (matches.length === 0) {
-        const targetSummary = options.target
-          ? ` for target "${options.target}"`
-          : '';
+        const targetSummary =
+          targets.length > 0 ? ` for target "${targets.join(', ')}"` : '';
         const kindSummary = options.kind ? ` of kind "${options.kind}"` : '';
         throw new AgentPmError(
           `No catalog entry named "${requestedName}"${targetSummary}${kindSummary} found.`,
@@ -4638,21 +4672,26 @@ export class AgentPmService {
     source: SourceRecord,
     entries: CatalogEntryRecord[],
     selectors: string[],
-    target?: AdapterId,
+    target?: AdapterId | AdapterId[],
     kind?: EntryKind,
   ): Promise<Array<{ source: SourceRecord; entry: CatalogEntryRecord }>> {
+    const targetList = Array.isArray(target) ? target : target ? [target] : [];
     const selections: Array<{
       source: SourceRecord;
       entry: CatalogEntryRecord;
     }> = [];
     for (const selector of selectors) {
-      const matches = entries.filter(
-        (entry) =>
-          matchesCatalogEntrySelector(entry, selector) &&
-          (!kind || this.catalogEntryKind(entry) === kind),
+      const matches = selectEntriesForTargets(
+        entries.filter(
+          (entry) =>
+            matchesCatalogEntrySelector(entry, selector) &&
+            (!kind || this.catalogEntryKind(entry) === kind),
+        ),
+        targetList,
       );
       if (matches.length === 0) {
-        const targetSummary = target ? ` for target "${target}"` : '';
+        const targetSummary =
+          targetList.length > 0 ? ` for target "${targetList.join(', ')}"` : '';
         const kindSummary = kind ? ` of kind "${kind}"` : '';
         throw new AgentPmError(
           `No catalog entry named "${selector}"${targetSummary}${kindSummary} found in source ${source.displayName}.`,
@@ -4660,7 +4699,6 @@ export class AgentPmService {
       }
 
       const entry = await this.chooseCatalogEntry(selector, matches, {
-        target,
         kind,
       });
       selections.push({ source, entry });
