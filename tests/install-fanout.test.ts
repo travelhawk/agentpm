@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { describe, expect, test } from 'vitest';
 
 import { AgentPmService } from '@agentpm/core';
+import type { AgentPmDatabase } from '@agentpm/db';
 
 import { git, initFixtureGitRepo, makeTempDir, writeFile } from './helpers';
 
@@ -127,6 +128,29 @@ describe('install for several agents', () => {
       try {
         const installs = await service.install(['alpha'], { scope: 'project' });
         expect(installs.map((install) => install.adapter)).toEqual(['generic']);
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'a record for the same folder under another id is replaced, not rejected',
+    async () => {
+      const { service, projectDir } = await setup();
+      try {
+        const [first] = await service.install(['alpha'], { scope: 'project' });
+        expect(first).toBeDefined();
+        const db = (service as unknown as { db: AgentPmDatabase }).db;
+        // Same folder, new id: what a second source for one repository does.
+        db.saveInstall({ ...first!, id: `${first!.id}-other` });
+        const records = service
+          .listInstalls()
+          .filter((install) => install.name === 'alpha');
+        expect(records).toHaveLength(1);
+        expect(records[0]!.id).toBe(`${first!.id}-other`);
+        expect(projectDir).toBeTruthy();
       } finally {
         service.close();
       }
