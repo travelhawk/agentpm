@@ -248,6 +248,7 @@ export async function materializeGitRelease(
       !expectedRevision ||
       (await releaseMatchesRevision(releasePath, expectedRevision))
     ) {
+      await ensureSparsePathsPresent(releasePath, options.sparsePaths);
       return { releasePath, revision: targetRevision };
     }
     // The cached release does not hold the revision it is keyed by.
@@ -354,6 +355,30 @@ export async function createTemporaryGitRelease(
     ref,
     env,
   });
+}
+
+// A release is shared by every skill of a repository, but it was checked out
+// sparsely for the first skill only. Add the paths a later caller needs, or
+// fall back to a full checkout of that same release.
+async function ensureSparsePathsPresent(
+  releasePath: string,
+  sparsePaths: string[],
+): Promise<void> {
+  const missing: string[] = [];
+  for (const sparsePath of sparsePaths) {
+    if (!(await pathExists(path.join(releasePath, sparsePath)))) {
+      missing.push(sparsePath);
+    }
+  }
+  if (missing.length === 0) {
+    return;
+  }
+  const repo = simpleGit(releasePath);
+  try {
+    await repo.raw(['sparse-checkout', 'add', ...missing]);
+  } catch {
+    await repo.raw(['sparse-checkout', 'disable']);
+  }
 }
 
 export function normalizeSparsePaths(paths: string[]): string[] {

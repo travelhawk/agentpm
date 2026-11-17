@@ -139,9 +139,62 @@ export async function ensureManagedLink(linkPath: string, targetPath: string): P
   await fs.symlink(targetPath, linkPath, linkType);
 }
 
+/**
+ * Removes a link AgentPM created. Only symlinks and junctions (including broken
+ * ones) are removed; a real folder or file at the path is user content and is
+ * never deleted.
+ */
 export async function removeManagedLink(linkPath: string): Promise<void> {
-  if (await pathExists(linkPath)) {
-    await fs.rm(linkPath, { recursive: true, force: true });
+  const stats = await fs.lstat(linkPath).catch(() => null);
+  if (!stats) {
+    return;
+  }
+  if (!stats.isSymbolicLink()) {
+    throw new AgentPmError(
+      `${linkPath} is not a link AgentPM created, so it was left untouched. ` +
+        'Move or delete it yourself if you want AgentPM to manage this path.',
+    );
+  }
+  await fs.rm(linkPath, { recursive: true, force: true });
+}
+
+async function listTreeEntries(rootPath: string): Promise<string[]> {
+  const result: string[] = [];
+  async function visit(current: string): Promise<void> {
+    const entries = await fs.readdir(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      result.push(path.relative(rootPath, full).split(path.sep).join('/'));
+      if (entry.isDirectory()) {
+        await visit(full);
+      }
+    }
+  }
+  await visit(rootPath);
+  return result.sort();
+}
+
+/**
+ * Copies a folder completely: dot-folders, node_modules, empty folders and
+ * symlinks included (links are copied as links, not followed). The copy is
+ * verified against the origin by entry list, so callers can safely delete the
+ * origin afterwards.
+ */
+export async function copyTreeVerbatim(src: string, dest: string): Promise<void> {
+  await fs.rm(dest, { recursive: true, force: true });
+  await ensureDir(path.dirname(dest));
+  await fs.cp(src, dest, { recursive: true, verbatimSymlinks: true });
+  const [expected, actual] = await Promise.all([
+    listTreeEntries(src),
+    listTreeEntries(dest),
+  ]);
+  const actualSet = new Set(actual);
+  const missing = expected.filter((entry) => !actualSet.has(entry));
+  if (missing.length > 0 || expected.length !== actual.length) {
+    await fs.rm(dest, { recursive: true, force: true });
+    throw new AgentPmError(
+      `Copying ${src} to ${dest} was incomplete (missing: ${missing.slice(0, 5).join(', ') || 'unknown'}). The original was not changed.`,
+    );
   }
 }
 

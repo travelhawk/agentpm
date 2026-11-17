@@ -26,6 +26,7 @@ import {
 import { AgentPmDatabase } from '@agentpm/db';
 import {
   computeTreeSignature,
+  copyTreeVerbatim,
   diffTrees,
   ensureDir,
   ensureManagedLink,
@@ -1112,7 +1113,10 @@ export class AgentPmService {
         install.contentRef ?? undefined,
         this.env,
       );
-      if (candidateRevision === install.installedRevision) {
+      // Same revision but its files are gone (cache cleaned or deleted): fall
+      // through and rebuild that revision, which repairs the link.
+      const contentPresent = await pathExists(install.linkTarget);
+      if (candidateRevision === install.installedRevision && contentPresent) {
         previews.push({
           install,
           source,
@@ -1150,7 +1154,12 @@ export class AgentPmService {
           candidateRevision,
           diff,
           risk: updateResult.risk,
-          warnings: updateResult.warnings,
+          warnings: contentPresent
+            ? updateResult.warnings
+            : [
+                'Its files were missing; AgentPM restores them.',
+                ...updateResult.warnings,
+              ],
           nextLinkTarget,
         });
       } finally {
@@ -2316,6 +2325,43 @@ export class AgentPmService {
     await ensureManagedLink(linkPath, linkTarget);
   }
 
+  // A link that points into the library or AgentPM's cache is AgentPM's own
+  // bookkeeping. Any other link leads to a folder the user keeps elsewhere:
+  // copying it would leave the link pointing at the original.
+  private async assertLinkOriginIsAdoptable(
+    name: string,
+    linkPath: string,
+  ): Promise<void> {
+    const resolved = await realpathOrNull(linkPath);
+    if (resolved) {
+      for (const managedDir of [
+        this.paths.skillsLibraryDir,
+        this.paths.cacheDir,
+      ]) {
+        const real = (await realpathOrNull(managedDir)) ?? managedDir;
+        if (
+          isWithinDirectory(managedDir, resolved) ||
+          isWithinDirectory(real, resolved)
+        ) {
+          return;
+        }
+      }
+    }
+    const target =
+      resolved ??
+      (await fs.readlink(linkPath).catch(() => null)) ??
+      'an unknown location';
+    throw new AgentPmError(
+      [
+        `"${name}" at ${linkPath} is a link to ${target}, not a skill folder AgentPM can move. Nothing was changed.`,
+        resolved
+          ? `Adopt that folder instead: agentpm adopt "${target}"`
+          : 'The link is broken: remove it, then adopt the real folder.',
+        'Or remove the link first and adopt again.',
+      ].join('\n'),
+    );
+  }
+
   private async copyTreeInto(src: string, dest: string): Promise<void> {
     await fs.rm(dest, { recursive: true, force: true });
     const files = await walkFiles(src);
@@ -2799,6 +2845,9 @@ export class AgentPmService {
 
     const originStat = await fs.lstat(contentPath).catch(() => null);
     const originIsLink = originStat?.isSymbolicLink() ?? false;
+    if (originIsLink) {
+      await this.assertLinkOriginIsAdoptable(name, contentPath);
+    }
 
     if (await pathExists(libraryPath)) {
       if (!originIsLink) {
@@ -2839,7 +2888,10 @@ export class AgentPmService {
       }
     } else {
       this.reportStatus(`Moving "${name}" into the skill library...`);
-      await this.copyTreeInto(contentPath, libraryPath);
+      await copyTreeVerbatim(
+        originIsLink ? await fs.realpath(contentPath) : contentPath,
+        libraryPath,
+      );
     }
 
     // Replace the original location with a managed symlink into the library so
@@ -3229,7 +3281,7 @@ export class AgentPmService {
           installId: install.id,
           path: install.targetPath,
           message: `Broken link detected: ${install.targetPath}`,
-          remedy: 'Run agentpm remove/install to repair the link.',
+          remedy: `Run \`agentpm update ${install.name}\` to restore it, or \`agentpm remove ${install.name}\` if you no longer need it.`,
         });
       }
 
@@ -3392,11 +3444,13 @@ export class AgentPmService {
           results.push({ action, applied: false });
           continue;
         }
-        // Only unlink: a real folder inside the cache is cache content.
+        // Only unlink: a real folder is cache or user content. A broken link
+        // is safe to remove: it leads nowhere.
         const target = await fs.lstat(install.targetPath).catch(() => null);
         if (
           target?.isSymbolicLink() &&
-          isWithinDirectory(this.paths.cacheDir, install.scopeRoot)
+          (isWithinDirectory(this.paths.cacheDir, install.scopeRoot) ||
+            (await isBrokenLink(install.targetPath)))
         ) {
           await removeManagedLink(install.targetPath);
         }
@@ -4957,6 +5011,7 @@ export class AgentPmService {
         recursive: true,
         force: true,
       });
+      this.db.deleteCacheRepo(install.cacheKey);
     }
 
     // If this was a plugin install, refresh its agent's managed marketplace.
