@@ -1,4 +1,3 @@
-
 // skill-security-check scanner: a static, offline pre-install check for agent skills.
 //
 // It reads bytes and text only. It never executes, imports or renders the
@@ -19,7 +18,7 @@ import { builtinModules } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { URL, fileURLToPath } from 'node:url';
 
 import {
   TRUST_SCHEMA_VERSION,
@@ -29,6 +28,7 @@ import {
   normalizeName,
   parseInstallCommand,
   parseManifest,
+  pinHint,
   resolveDependencies,
 } from './package-policy.mjs';
 import {
@@ -2191,9 +2191,11 @@ function checkManifest(base, ext, text, file, ctx) {
       const names = [...text.matchAll(/^\s*"([\w.-]+)"\s*:\s*\{\s*$/gm)]
         .map((m) => m[1])
         .filter((k) => !/^(?:mcpServers|env|headers)$/.test(k));
+      // An MCP server is a capability with honest uses, like a network call:
+      // a person decides. Its URLs and commands meet their own rules.
       findings.add({
         rule: 'mcp-server',
-        severity: REJECT,
+        severity: REVIEW,
         category: 'external-server',
         file,
         message: `Declares MCP server(s)${names.length ? `: ${names.slice(0, 8).join(', ')}` : ''}; the agent would connect to or launch them`,
@@ -2626,9 +2628,33 @@ const EICAR = [
   'EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*',
 ].join('');
 
+// Defender turned off because another antivirus product is registered is not
+// a fault. MpCmdRun only says so in its log, so read the entry of the run
+// that just ended, and only when the log was written by that run: an old
+// entry must not turn a broken Defender into a quiet "off". The signal must
+// be a whole status line, so text from a scanned path or file name cannot
+// produce it. Stripping NULs reads both the ANSI and the UTF-16 log format.
+const DEFENDER_OFF_RE =
+  /^\s*(?:WARN:\s*)?Product\/Feature disabled\.?\s*$|^\s*(?:MpCmdRun(?:\.exe)?|CmdTool):[^\n]*\bhr\s*=\s*0x800106ba\b/im;
+
+function defenderTurnedOff(out, started) {
+  if (DEFENDER_OFF_RE.test(out)) return true;
+  try {
+    const file = path.join(os.tmpdir(), 'MpCmdRun.log');
+    if (fs.statSync(file).mtimeMs < started - 2000) return false;
+    const all = fs.readFileSync(file).toString('latin1').replace(/\0/g, '');
+    return DEFENDER_OFF_RE.test(
+      all.slice(all.lastIndexOf('MpCmdRun: Command Line:')),
+    );
+  } catch {
+    return false;
+  }
+}
+
 function runDefender(root) {
   const exe = findDefender();
   if (!exe) return null;
+  const started = Date.now();
   const r = spawnSync(
     exe,
     ['-Scan', '-ScanType', '3', '-File', root, '-DisableRemediation'],
@@ -2643,23 +2669,11 @@ function runDefender(root) {
   );
   const engine = 'Microsoft Defender';
   if (r.status === 0) return { engine, status: 'clean' };
-  // Turned off because another antivirus product is registered: not a fault.
-  // MpCmdRun only says so in its log, so read the entry of the run that just
-  // ended. Stripping NULs reads both the ANSI and the UTF-16 log format.
-  let log = '';
-  try {
-    const all = fs
-      .readFileSync(path.join(os.tmpdir(), 'MpCmdRun.log'))
-      .toString('latin1')
-      .replace(/\0/g, '');
-    log = all.slice(all.lastIndexOf('MpCmdRun: Command Line:'));
-  } catch {
-    /* no log: judge by the output alone */
-  }
-  if (/Product\/Feature disabled|0x800106ba/i.test(`${out}\n${log}`))
-    return { engine, status: 'off', detail: 'turned off on this machine' };
-  // Exit code 2 means "threats found" but is also used for failures, so require a parsed threat.
+  // A detection wins over everything else. Exit code 2 means "threats found"
+  // but is also used for failures, so require a parsed threat.
   if (threats.length) return { engine, status: 'threat', threats, files };
+  if (!r.error && defenderTurnedOff(out, started))
+    return { engine, status: 'off', detail: 'turned off on this machine' };
   return {
     engine,
     status: 'unavailable',
@@ -3067,13 +3081,14 @@ function analyseDependencies(ctx, policy) {
       .filter((v, i, a) => a.indexOf(v) === i)
       .slice(0, 4)
       .join(', ');
+    const hint = pinHint(pkg.ecosystem, pkg.name, pkg.version, pkg.class);
     ctx.findings.add({
       rule: `dep-${pkg.class}`,
       severity: pkg.severity,
       category: 'dependency',
       file: pkg.locations[0]?.file ?? '',
       line: pkg.locations[0]?.line ?? 0,
-      message: `${pkg.ecosystem} package '${displaySpec(pkg.ecosystem, pkg.name, pkg.version)}': ${pkg.why}`,
+      message: `${pkg.ecosystem} package '${displaySpec(pkg.ecosystem, pkg.name, pkg.version)}': ${pkg.why}${hint ? `. ${hint}` : ''}`,
       evidence: where,
     });
   }
@@ -3133,6 +3148,11 @@ function analyseUrls(ctx, policy) {
   // mutable host cannot hand it code: `curl -I`, `curl -sI`, `--head`,
   // `wget --spider`. It is still a fetch of a volatile host, so it lands on
   // REVIEW rather than passing silently.
+  // `gist.github.com/<user>/<id>` renders a page for a person, like a
+  // `/blob/` link; only its `/raw` path hands bytes to a machine. The page
+  // is then judged like any other address on what the skill does with it.
+  const isGistPage = (h) =>
+    /^gist\.github\.com$/i.test(h.host) && !/\/raw(?:\/|$)/i.test(h.value);
   const isHeaderOnly = (h) => {
     const l = h.line || '';
     return (
@@ -3145,13 +3165,77 @@ function analyseUrls(ctx, policy) {
   // nothing can be swapped after the review. Nobody scanned those bytes either,
   // so it lands on REVIEW rather than passing. A tag or branch name can move,
   // which is why only a 40-hex commit counts.
-  const isCommitPinned = (h) =>
-    /^https?:\/\/raw\.githubusercontent\.com\/[^/]+\/[^/]+\/[0-9a-f]{40}\//i.test(
-      h.value,
-    ) ||
-    /^https?:\/\/gist\.githubusercontent\.com\/[^/]+\/[0-9a-f]+\/raw\/[0-9a-f]{40}\//i.test(
-      h.value,
+  //
+  // The test runs on the address as a client will request it. curl and fetch
+  // resolve `..`, `.`, `%2e` and `\` first, so `/<sha>/../main/x` asks for a
+  // branch. Any address that normalisation changes is not counted as pinned.
+  const isCommitPinned = (h) => {
+    let url;
+    try {
+      url = new URL(h.value);
+    } catch {
+      return false;
+    }
+    const rawPath = h.value
+      .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/\\?#]*/i, '')
+      .split(/[?#]/)[0];
+    if (rawPath !== url.pathname) return false;
+    return (
+      (url.hostname === 'raw.githubusercontent.com' &&
+        /^\/[^/]+\/[^/]+\/[0-9a-f]{40}\//i.test(url.pathname)) ||
+      (url.hostname === 'gist.githubusercontent.com' &&
+        /^\/[^/]+\/[0-9a-f]+\/raw\/[0-9a-f]{40}\//i.test(url.pathname))
     );
+  };
+  // A known installer or a trusted publisher, as listed in the policy. Runs on
+  // the normalised address only, like the commit pin: an address that
+  // normalisation changes (`/Homebrew/../evil/`) never matches.
+  const trustedSource = (h) => {
+    let url;
+    try {
+      url = new URL(h.value);
+    } catch {
+      return null;
+    }
+    const rawPath = h.value
+      .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/\\?#]*/i, '')
+      .split(/[?#]/)[0];
+    if (rawPath !== url.pathname && !(rawPath === '' && url.pathname === '/'))
+      return null;
+    const host = url.hostname.toLowerCase();
+    const segs = url.pathname.split('/').filter(Boolean);
+    const sources = trust.trustedSources ?? {};
+    for (const entry of sources.installers ?? []) {
+      let want;
+      try {
+        want = new URL(entry);
+      } catch {
+        continue;
+      }
+      const wantSegs = want.pathname.split('/').filter(Boolean);
+      if (
+        want.protocol === url.protocol &&
+        want.hostname.toLowerCase() === host &&
+        !url.search &&
+        wantSegs.length === segs.length &&
+        wantSegs.every((s, i) => s === '*' || s === segs[i])
+      )
+        return entry;
+    }
+    for (const entry of sources.publishers ?? []) {
+      const [eHost, org] = entry.toLowerCase().split('/');
+      if (!org) {
+        if (host === eHost || host.endsWith(`.${eHost}`)) return entry;
+        continue;
+      }
+      const hosts =
+        eHost === 'github.com'
+          ? ['github.com', 'raw.githubusercontent.com', 'codeload.github.com']
+          : [eHost];
+      if (hosts.includes(host) && segs[0]?.toLowerCase() === org) return entry;
+    }
+    return null;
+  };
   // What the skill does with the address itself. Attribution cannot argue with
   // any of these, so they are checked first.
   const isActedOn = (h) =>
@@ -3201,7 +3285,11 @@ function analyseUrls(ctx, policy) {
       severity = REVIEW;
       rule = 'url-destination';
       note = '; the skill names it as a place to send data';
-    } else if (hostMatches(hit.host, trust.contentHosts) && !isTemplate(hit)) {
+    } else if (
+      hostMatches(hit.host, trust.contentHosts) &&
+      !isTemplate(hit) &&
+      !isGistPage(hit)
+    ) {
       // A raw-content host, a paste site or a link shortener exists to hand
       // bytes to a machine. Naming one in prose is an invitation to fetch it,
       // and what comes back can be swapped after the review, so the context
@@ -3215,6 +3303,10 @@ function analyseUrls(ctx, policy) {
         rule = 'url-fetched';
         note =
           '; pinned to a commit, so the content cannot change, but it was not scanned';
+      } else if (trustedSource(hit)) {
+        severity = REVIEW;
+        rule = 'url-trusted-source';
+        note = `; a trusted source (${trustedSource(hit)}), but the content can change after review`;
       } else {
         severity = REJECT;
         rule = 'url-mutable-host';
@@ -3234,7 +3326,11 @@ function analyseUrls(ctx, policy) {
         (trust.mutablePaths ?? []).some((p) => hit.value.includes(p)) &&
         !isTemplate(hit) &&
         !isHeaderOnly(hit);
-      if (movingRef && (actedOn || isRemoteTarget(hit))) {
+      if (movingRef && (actedOn || isRemoteTarget(hit)) && trustedSource(hit)) {
+        severity = REVIEW;
+        rule = 'url-trusted-source';
+        note = `; a trusted source (${trustedSource(hit)}), but this address follows a branch, so its content can change after review`;
+      } else if (movingRef && (actedOn || isRemoteTarget(hit))) {
         // A moving branch ref on an ordinary host. `/blob/main/` renders a page
         // for a person to read, so it only counts once the skill fetches it.
         severity = REJECT;
@@ -4106,14 +4202,18 @@ function readOverride(file, notes) {
   }
 }
 
+// Override keys that extend the trusted sources instead of a package list.
+const SOURCE_KEYS = new Set(['installers', 'publishers']);
+
 function applyOverride(trust, override, strict, notes) {
   const packages = { ...trust.packages };
+  const sources = { ...(trust.trustedSources ?? {}) };
+  const listFor = (key) => (SOURCE_KEYS.has(key) ? sources : packages);
   // Removing trust can only make the scan stricter, so it always applies.
-  for (const [ecosystem, names] of Object.entries(override.remove)) {
+  for (const [key, names] of Object.entries(override.remove)) {
     const drop = new Set(names);
-    packages[ecosystem] = (packages[ecosystem] ?? []).filter(
-      (n) => !drop.has(n),
-    );
+    const target = listFor(key);
+    target[key] = (target[key] ?? []).filter((n) => !drop.has(n));
   }
   const added = [];
   const wants = Object.entries(override.add);
@@ -4122,12 +4222,13 @@ function applyOverride(trust, override, strict, notes) {
   } else {
     // An agent can write this file, and a skill's own prose can tell it to, so
     // every name trusted only through the override is named in the report.
-    for (const [ecosystem, names] of wants) {
-      packages[ecosystem] = [...(packages[ecosystem] ?? []), ...names];
-      for (const n of names) added.push(`${ecosystem}:${n}`);
+    for (const [key, names] of wants) {
+      const target = listFor(key);
+      target[key] = [...(target[key] ?? []), ...names];
+      for (const n of names) added.push(`${key}:${n}`);
     }
   }
-  return { trust: { ...trust, packages }, added };
+  return { trust: { ...trust, packages, trustedSources: sources }, added };
 }
 
 function policyHash(policy) {
@@ -4145,6 +4246,8 @@ function policyHash(policy) {
         docHosts: t.docHosts,
         contentHosts: t.contentHosts,
         mutablePaths: t.mutablePaths,
+        installers: [...(t.trustedSources?.installers ?? [])].sort(),
+        publishers: [...(t.trustedSources?.publishers ?? [])].sort(),
       }),
     )
     .digest('hex');

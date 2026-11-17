@@ -1,4 +1,3 @@
-
 // tiny-av: the antivirus engine bundled with skill-security-check.
 //
 // It is small on purpose: a few signatures for attack tooling that has no
@@ -53,6 +52,10 @@ const DOC_EXT = new Set([
   '.html',
   '.htm',
 ]);
+
+function isDocName(name) {
+  return DOC_EXT.has(path.extname(String(name)).toLowerCase());
+}
 
 // ---------------------------------------------------------------------------
 // Signatures
@@ -195,19 +198,27 @@ function inflate(buf, fn) {
   }
 }
 
-function* zipEntries(buf) {
+const EOCD = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
+
+// The end record sits in the last 64 KB (its comment is at most 0xffff bytes).
+// Extractors find a zip from here, not from byte 0, so a zip behind a script
+// or an image is still a zip.
+function findEocd(buf) {
+  if (buf.length < 22) return -1;
+  const at = buf.lastIndexOf(EOCD, buf.length - 22);
+  return at >= 0 && at >= buf.length - 0xffff - 22 ? at : -1;
+}
+
+function* zipEntries(buf, eocd) {
   // Walk the central directory: sizes in local headers can be zero when a
-  // data descriptor follows, the central directory always has them.
-  const min = Math.max(0, buf.length - 0xffff - 22);
-  let eocd = -1;
-  for (let i = buf.length - 22; i >= min; i -= 1)
-    if (buf.readUInt32LE(i) === 0x06054b50) {
-      eocd = i;
-      break;
-    }
-  if (eocd < 0) return;
+  // data descriptor follows, the central directory always has them. Offsets
+  // count from the start of the archive, so bytes in front of it shift them
+  // all by the same amount. Zip64 archives (offset 0xffffffff) are not read.
   const count = Math.min(buf.readUInt16LE(eocd + 10), LIMITS.maxZipEntries);
-  let p = buf.readUInt32LE(eocd + 16);
+  const cdSize = buf.readUInt32LE(eocd + 12);
+  const cdOffset = buf.readUInt32LE(eocd + 16);
+  const shift = Math.max(0, eocd - (cdOffset + cdSize));
+  let p = cdOffset + shift;
   for (let k = 0; k < count; k += 1) {
     if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) return;
     const method = buf.readUInt16LE(p + 10);
@@ -215,7 +226,7 @@ function* zipEntries(buf) {
     const nameLen = buf.readUInt16LE(p + 28);
     const extraLen = buf.readUInt16LE(p + 30);
     const commentLen = buf.readUInt16LE(p + 32);
-    const local = buf.readUInt32LE(p + 42);
+    const local = buf.readUInt32LE(p + 42) + shift;
     const name = buf.toString('utf8', p + 46, p + 46 + nameLen);
     p += 46 + nameLen + extraLen + commentLen;
     if (local + 30 > buf.length || buf.readUInt32LE(local) !== 0x04034b50)
@@ -279,14 +290,17 @@ function scanLayers(buf, layer, budget, hits) {
       });
   }
   if (layer.depth >= LIMITS.maxDepth) return;
-  const child = (label, data, hidden) => {
+  // Only text a person reads is documentation. A compressed file is binary
+  // whatever its name says, so its content counts as code; a zip entry is
+  // judged by its own name, as it would be on disk.
+  const child = (label, data, hidden, doc = false) => {
     if (!data?.length || budget.bytes < data.length) return;
     budget.bytes -= data.length;
     scanLayers(
       data,
       {
         depth: layer.depth + 1,
-        doc: layer.doc,
+        doc,
         hidden: layer.hidden || hidden,
         where: [...layer.where, label],
       },
@@ -298,13 +312,17 @@ function scanLayers(buf, layer, budget, hits) {
     return child('gzip', inflate(buf, zlib.gunzipSync), false);
   if (buf[0] === 0x78 && [0x01, 0x5e, 0x9c, 0xda].includes(buf[1]))
     child('zlib', inflate(buf, zlib.inflateSync), false);
-  if (buf.length >= 4 && buf.readUInt32LE(0) === 0x04034b50) {
-    for (const e of zipEntries(buf)) child(`zip:${e.name}`, e.data, false);
-    return;
+  const eocd = findEocd(buf);
+  if (eocd >= 0) {
+    for (const e of zipEntries(buf, eocd))
+      child(`zip:${e.name}`, e.data, false, isDocName(e.name));
+    // Bytes in front of the archive are a file of their own (a script with
+    // a zip appended), so they are still read as text below.
+    if (buf.readUInt32LE(0) === 0x04034b50) return;
   }
   if (looksUtf16le(buf)) {
     const s = buf.toString('utf16le').replace(/^\uFEFF/, '');
-    return child('utf-16', Buffer.from(s, 'latin1'), false);
+    return child('utf-16', Buffer.from(s, 'latin1'), false, layer.doc);
   }
   if (!looksText(buf)) return;
   for (const [label, data] of decodeText(buf.toString('latin1')))
@@ -321,7 +339,8 @@ export function scanBuffer(buf, name = '') {
     buf,
     {
       depth: 0,
-      doc: DOC_EXT.has(path.extname(name).toLowerCase()),
+      // A binary file is not documentation, whatever its name says.
+      doc: isDocName(name) && looksText(buf),
       hidden: false,
       where: [],
     },

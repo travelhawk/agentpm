@@ -142,6 +142,29 @@ describe('tiny-av bundled engine', () => {
     );
   });
 
+  // The two strings together are the Chromium password-store signature, a
+  // 'code' scope one that documentation is allowed to mention.
+  const STEALER = Buffer.from('open("Login Data"); k = s["encrypted_key"]\n');
+
+  it('judges a container by its content, not by a documentation name', () => {
+    expect(names(gzipSync(STEALER), 'README.md')).toContain(
+      'Stealer.ChromiumPasswords',
+    );
+    expect(names(zip('steal.py', STEALER), 'notes.txt')).toContain(
+      'Stealer.ChromiumPasswords',
+    );
+    // A zip entry is documentation by its own name, as it is on disk.
+    expect(names(zip('guide.md', STEALER), 'docs.zip')).toEqual([]);
+  });
+
+  it('finds a zip that sits behind other bytes', () => {
+    const prefixed = Buffer.concat([
+      Buffer.from('#!/bin/sh\nexit 0\n'),
+      zip('steal.py', STEALER),
+    ]);
+    expect(names(prefixed, 'tool.sh')).toContain('Stealer.ChromiumPasswords');
+  });
+
   it('flags a PHP web shell', () => {
     const shell = ['<?php @ev', 'al(base64_decode($_PO', "ST['c'])); ?>"].join(
       '',

@@ -233,6 +233,15 @@ export function classifySource(rawSpec) {
   return { source: 'default-registry', target: null, version: spec };
 }
 
+// The registry is part of an image reference (`ghcr.io/org/app`), so naming
+// one does not redirect any other install the way a custom package index
+// does. What matters for an image is the digest, so it gets its own source.
+function imageSource(name) {
+  return /^[\w-]+(?:\.[\w-]+)+(?::\d+)?\/|^localhost(?::\d+)?\//.test(name)
+    ? 'image-registry'
+    : 'default-registry';
+}
+
 /**
  * Splits `name@version`, `name==version`, `image:tag` into parts. Scoped npm
  * names keep their leading `@`.
@@ -254,7 +263,11 @@ export function splitSpec(ecosystem, token) {
 
   if (ecosystem === 'pypi') {
     const m = /^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*(.*)$/.exec(raw);
-    if (!m) return { name: raw, version: '' };
+    // A version part starts with an operator, a marker or a URL. Anything else
+    // means the name itself goes on: `r` + Cyrillic `еquests` is one name
+    // that the name check must see whole, not the package `r`.
+    if (!m || (m[3] && !/^[=<>~!;@,(]/.test(m[3])))
+      return { name: raw, version: '' };
     return { name: m[1], version: (m[3] ?? '').trim() };
   }
 
@@ -396,6 +409,11 @@ export function tokenize(command) {
   let m;
   while ((m = re.exec(command)) !== null) {
     const raw = m[0];
+    // An unquoted `#` at the start of a word begins a comment, as in the
+    // shell: `npm i -g neon  # npm` installs one package, not two. A line
+    // that starts with `#` is kept: in a skill, `# Install: brew install yq`
+    // is an instruction the agent may follow, not dead code.
+    if (raw.startsWith('#') && out.length) break;
     // Redirections are not arguments. `command -v npx >/dev/null` otherwise
     // hands `/dev/null` to npx as the package to run.
     const redirect = /^(?:\d*|&)(?:>>?|<)(.*)$/.exec(raw);
@@ -434,6 +452,18 @@ function cleanToken(tok) {
 
 function isOption(t) {
   return t.startsWith('-');
+}
+
+// Documentation writes notes after a command on the same line:
+// `pnpm install   ← install deps`, `npm i -g x   (~20s)`. A token without a
+// single letter or digit, or one opening with a bracket, is never a package
+// spec, so the arguments end there. Letters of any script count, so a
+// homoglyph name is still read and rejected by the name check.
+function untilProse(tokens) {
+  const end = tokens.findIndex(
+    (t) => !/[\p{L}\p{N}]/u.test(t) || /^[([{]/.test(t),
+  );
+  return end === -1 ? tokens : tokens.slice(0, end);
 }
 
 // Options that swallow the next token. Without these, `pip install
@@ -577,7 +607,7 @@ export function parseInstallCommand(line) {
         .replace(/\.exe$/i, '')
         .split('/')
         .pop() ?? '';
-    const rest = t.slice(i + 1);
+    const rest = untilProse(t.slice(i + 1));
     const push = (o) => deps.push(o);
 
     const scriptsDisabled =
@@ -963,9 +993,7 @@ export function parseInstallCommand(line) {
         rawName: name,
         version,
         pinKind: classifyPin('docker', version),
-        source: /^[\w.-]+\.[\w.-]+\//.test(name)
-          ? 'custom-index'
-          : 'default-registry',
+        source: imageSource(name),
         via: 'container',
         runsCode: sub !== 'pull',
         scriptsDisabled: false,
@@ -1573,17 +1601,25 @@ export function parseManifest(base, ext, text) {
         : [...text.matchAll(/^\s*image:\s*["']?([^"'\s]+)/gim)].map(
             (m) => m[1],
           );
+    // `FROM node:22 AS build` names a stage; a later `FROM build` reuses it
+    // and pulls nothing. `scratch` is the empty image and is never pulled.
+    const stages = new Set(
+      lower === 'dockerfile'
+        ? [...text.matchAll(/^\s*FROM\s+\S.*?\s+AS\s+(\S+)/gim)].map((m) =>
+            m[1].toLowerCase(),
+          )
+        : [],
+    );
     for (const image of images) {
       if (/^\$|^\{\{/.test(image)) continue; // a build argument, not an image
+      if (image === 'scratch' || stages.has(image.toLowerCase())) continue;
       const { name, version } = splitSpec('docker', image);
       push({
         ecosystem: 'docker',
         rawName: name,
         version,
         pinKind: classifyPin('docker', version),
-        source: /^[\w.-]+\.[\w.-]+\//.test(name)
-          ? 'custom-index'
-          : 'default-registry',
+        source: imageSource(name),
         via: 'container',
         runsCode: true,
       });
@@ -1662,6 +1698,11 @@ export const DEP_CLASSES = Object.freeze({
     severity: REVIEW,
     why: 'container image pinned by digest, but its contents were not analysed',
   },
+  'image-tag': {
+    severity: REVIEW,
+    why: 'container image by tag: the owner can push different content under the same tag',
+    strict: REJECT,
+  },
   'name-near-miss': {
     severity: REVIEW,
     why: 'the name is one edit from a well-known package',
@@ -1693,6 +1734,55 @@ export function displaySpec(ecosystem, name, version) {
       : `${name}:${version}`;
   if (ecosystem === 'os') return name;
   return `${name}@${version}`;
+}
+
+// Classes whose content is not fixed yet. A pin turns each of them into a
+// smaller decision, so the report says how to pin.
+const PINNABLE = new Set([
+  'image-tag',
+  'trusted-unpinned',
+  'unknown-name',
+  'executes-fetched',
+  'name-near-miss',
+]);
+
+/**
+ * How to nail a package down, or '' when it is already pinned or a pin would
+ * not help. The scanner is offline, so the hint names the command that looks
+ * the version up; it never guesses one. `latest`, and no version at all, ask
+ * for whatever is newest at install time, so the hint says that first.
+ */
+export function pinHint(ecosystem, name, version, className) {
+  if (!PINNABLE.has(className)) return '';
+  const v = String(version ?? '').trim();
+  const floating = !v || /^latest$/i.test(v);
+  const now = floating
+    ? `'${v || 'no version'}' installs whatever is newest at install time. `
+    : '';
+  switch (ecosystem) {
+    case 'docker':
+      if (/^sha256:/i.test(v)) return '';
+      return `${now}Pin by digest: \`docker buildx imagetools inspect ${name}:${v || 'latest'}\` shows it; then use \`${name}@sha256:<digest>\`.`;
+    case 'npm':
+      if (classifyPin('npm', v) === 'exact') return '';
+      return `${now}Pin an exact version: \`npm view ${name} version\` shows the current one; then use \`${name}@<version>\`, and \`--ignore-scripts\` where the package allows it.`;
+    case 'pypi':
+      if (classifyPin('pypi', v) === 'exact') return '';
+      return `${now}Pin an exact version: \`pip index versions ${name}\` lists them; then use \`${name}==<version>\`, ideally with \`--hash=sha256:...\`.`;
+    case 'go':
+      if (classifyPin('go', v) === 'exact') return '';
+      return `${now}Pin a release: \`go list -m -versions ${name}\` lists them; then use \`${name}@v<x.y.z>\`.`;
+    case 'cargo':
+      return `${now}Pin an exact version: \`${name} = "=<x.y.z>"\`, and commit Cargo.lock.`;
+    case 'rubygems':
+    case 'nuget':
+    case 'composer':
+      return now
+        ? `${now}Pin an exact version and commit the lockfile.`
+        : 'Pin an exact version and commit the lockfile.';
+    default:
+      return '';
+  }
 }
 
 function severityFor(className, strict) {
@@ -1740,8 +1830,11 @@ export function classifyDependency(obs, trust, options = {}) {
     : new Set();
 
   if (obs.ecosystem === 'docker') {
-    // A tag is a moving pointer; only a digest fixes the image.
-    if (obs.pinKind !== 'exact') return cls('untrusted-source');
+    // A tag is a moving pointer, on Docker Hub as on any other registry: the
+    // owner can push new content under it. Only a digest fixes the image, on
+    // every registry. Neither was scanned, so both are a person's decision.
+    if (obs.pinKind !== 'exact') return cls('image-tag');
+    if (obs.source === 'image-registry') return cls('image-pinned');
     return trusted.has(obs.key) ? cls('image-pinned') : cls('unknown-name');
   }
 

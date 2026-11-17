@@ -281,6 +281,35 @@ export const BUNDLED_TRUST = Object.freeze({
     'shorturl.at',
   ]),
 
+  // Sources whose moving content is a person's decision, not a block. They
+  // only ever lower a moving-content REJECT to REVIEW (`url-trusted-source`),
+  // never to PASS: a trusted vendor's branch can still change after review.
+  // Ignored under --strict. Extend them in the local override with
+  // `add.installers` / `add.publishers`.
+  trustedSources: Object.freeze({
+    // Official installer scripts, by exact address. `*` stands for one path
+    // segment, such as a release tag.
+    installers: Object.freeze([
+      'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh',
+      'https://raw.githubusercontent.com/nvm-sh/nvm/*/install.sh',
+      'https://sh.rustup.rs',
+      'https://astral.sh/uv/install.sh',
+      'https://bun.sh/install',
+      'https://deno.land/install.sh',
+      'https://get.pnpm.io/install.sh',
+    ]),
+    // Publishers: a domain, or `github.com/<org>`, which also covers that
+    // org on raw.githubusercontent.com and codeload.github.com.
+    publishers: Object.freeze([
+      'github.com/anthropics',
+      'github.com/modelcontextprotocol',
+      'github.com/neondatabase',
+      'neon.com',
+      'github.com/vercel',
+      'github.com/vercel-labs',
+    ]),
+  }),
+
   // URL paths that always resolve to whatever is newest, whatever the host.
   mutablePaths: Object.freeze([
     '/releases/latest',
