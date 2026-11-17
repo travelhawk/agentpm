@@ -10,6 +10,7 @@ import {
   registryLogin,
   registryLogout,
   registryWhoami,
+  sourceLabel,
   type InstallOptions,
   type ProviderInstalledSkillRecord,
   type ProviderSkillSearchResult,
@@ -1198,16 +1199,22 @@ source.command('list').option('--json', 'Print machine-readable JSON').action(as
     Promise.resolve(service.listSources()),
   );
   if (flags.json) {
-    printSuccessJson('source.list', { sources });
+    printSuccessJson('source.list', {
+      sources: sources.map((item) => ({ ...item, label: sourceLabel(item) })),
+    });
     return;
   }
   if (sources.length === 0) {
     console.log('No sources configured.');
     return;
   }
-  for (const item of sources) {
-    console.log(`${item.id}  ${item.kind}  ${item.locator}`);
-  }
+  const labels = sources.map((item) => sourceLabel(item));
+  const width = Math.max(...labels.map((label) => label.length));
+  sources.forEach((item, index) => {
+    console.log(
+      `${style.bold(labels[index]!.padEnd(width))}  ${item.kind.padEnd(8)}  ${item.locator}  ${style.gray(item.id)}`,
+    );
+  });
 });
 
 addExamples(

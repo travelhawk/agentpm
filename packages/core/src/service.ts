@@ -57,6 +57,7 @@ import {
   displayNameFromLocator,
   isGitHubRepoShorthand,
   makeId,
+  gitRepoIdentity,
   normalizeGitHubRepoLocator,
   nowIso,
   slugify,
@@ -113,6 +114,12 @@ import {
   type RemoveSourceResult,
   type SourceInstallsAction,
 } from './source-removal.js';
+import {
+  findDuplicateSources,
+  moveInstallToSource,
+  sourceIdentity,
+  sourceLabel,
+} from './source-dedupe.js';
 import {
   pickInstallToRemove,
   pickSourceToRemove,
@@ -370,6 +377,16 @@ export class AgentPmService {
     await this.initialize();
     const kind = await this.classifySource(locator);
     const normalizedLocator = this.normalizeLocator(locator, kind);
+    const sameRepository =
+      kind === 'git' ? this.findSourceByRepository(normalizedLocator) : null;
+    if (sameRepository) {
+      // The same repository under another address (ssh, https, github:)
+      // stays one source, so its skills are not listed twice.
+      this.reportStatus(
+        `${sourceLabel(sameRepository)} is already a source (${sameRepository.locator}); refreshing it...`,
+      );
+      return this.reindexSource(sameRepository);
+    }
     this.reportStatus(
       `Resolving source ${displayNameFromLocator(normalizedLocator)}...`,
     );
@@ -3167,6 +3184,21 @@ export class AgentPmService {
       }
     }
 
+    for (const group of findDuplicateSources(this.db.listSources(), (id) =>
+      this.db.countInstallsForSource(id),
+    )) {
+      for (const duplicate of group.duplicates) {
+        issues.push({
+          severity: 'warning',
+          code: 'source-duplicate',
+          sourceId: duplicate.id,
+          message: `Source ${duplicate.locator} is the same repository as ${group.keep.locator}.`,
+          remedy:
+            'Run `agentpm doctor --fix` to merge them. Its skills move to the kept source; nothing is uninstalled.',
+        });
+      }
+    }
+
     for (const install of this.db.listInstalls()) {
       const targetMissing = !(await pathExists(install.targetPath));
       if (targetMissing) {
@@ -3295,6 +3327,20 @@ export class AgentPmService {
         continue;
       }
 
+      if (issue.code === 'source-duplicate' && issue.sourceId) {
+        const duplicate = this.db.getSource(issue.sourceId);
+        const keep = duplicate ? this.findSameRepositorySource(duplicate) : null;
+        if (duplicate && keep) {
+          actions.push({
+            code: 'merge-duplicate-source',
+            sourceId: duplicate.id,
+            keepSourceId: keep.id,
+            description: `Merging duplicate source ${duplicate.locator} into ${keep.locator}`,
+          });
+        }
+        continue;
+      }
+
       if (
         !issue.sourceId ||
         (issue.code !== 'source-missing' &&
@@ -3356,10 +3402,59 @@ export class AgentPmService {
         }
         this.db.removeInstall(install.id);
         results.push({ action, applied: true });
+      } else if (action.code === 'merge-duplicate-source') {
+        const duplicate = this.db.getSource(action.sourceId);
+        const keep = this.db.getSource(action.keepSourceId);
+        if (!duplicate || !keep) {
+          results.push({ action, applied: false });
+          continue;
+        }
+        this.mergeSourceInto(duplicate, keep);
+        results.push({ action, applied: true });
       }
     }
 
     return results;
+  }
+
+  /** The kept source of the duplicate group `source` belongs to, if it is a duplicate. */
+  private findSameRepositorySource(source: SourceRecord): SourceRecord | null {
+    const group = findDuplicateSources(this.db.listSources(), (id) =>
+      this.db.countInstallsForSource(id),
+    ).find((entry) =>
+      entry.duplicates.some((duplicate) => duplicate.id === source.id),
+    );
+    return group?.keep ?? null;
+  }
+
+  /** Moves every install of `duplicate` onto `keep`, then deletes `duplicate`. */
+  private mergeSourceInto(duplicate: SourceRecord, keep: SourceRecord): void {
+    const previousEntries = this.db.listCatalogEntriesBySource(duplicate.id);
+    const keepEntries = this.db.listCatalogEntriesBySource(keep.id);
+    for (const install of this.db.listInstallsBySource(duplicate.id)) {
+      this.db.saveInstall(
+        moveInstallToSource(install, keep, keepEntries, previousEntries),
+      );
+    }
+    this.db.deleteSource(duplicate.id);
+  }
+
+  /** A stored source for the same remote repository as `locator`, if any. */
+  private findSourceByRepository(locator: string): SourceRecord | null {
+    const identity = gitRepoIdentity(locator);
+    if (!identity) {
+      return null;
+    }
+    const matches = this.db
+      .listSources()
+      .filter((source) => sourceIdentity(source) === identity);
+    if (matches.length === 0) {
+      return null;
+    }
+    const groups = findDuplicateSources(matches, (id) =>
+      this.db.countInstallsForSource(id),
+    );
+    return groups[0]?.keep ?? matches[0]!;
   }
 
   private async reindexSource(source: SourceRecord): Promise<AddSourceResult> {
@@ -3610,9 +3705,12 @@ export class AgentPmService {
           source.id === token ||
           source.locator === normalizedToken ||
           source.normalizedLocator === normalizedToken ||
-          slugify(source.displayName) === token
+          slugify(source.displayName) === token ||
+          sourceLabel(source) === token
         );
-      }) ?? null
+      }) ??
+      this.findSourceByRepository(token) ??
+      null
     );
   }
 

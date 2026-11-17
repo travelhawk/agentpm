@@ -558,6 +558,12 @@ export type DoctorFixAction =
       code: 'remove-install-record';
       installId: string;
       description: string;
+    }
+  | {
+      code: 'merge-duplicate-source';
+      sourceId: string;
+      keepSourceId: string;
+      description: string;
     };
 
 export interface DoctorFixResult {
@@ -606,6 +612,51 @@ export function isGitHubRepoShorthand(value: string): boolean {
 export function normalizeGitHubRepoLocator(value: string): string {
   const trimmed = value.trim();
   return isGitHubRepoShorthand(trimmed) ? `github:${trimmed}` : trimmed;
+}
+
+/**
+ * The repository a git locator points at, as `host/owner/repo`, so that
+ * `github:owner/repo`, `https://github.com/owner/repo.git` and
+ * `git@github.com:owner/repo.git` compare equal. Null for local paths and
+ * anything that is not a remote git address.
+ */
+export function gitRepoIdentity(locator: string): string | null {
+  const trimmed = normalizeGitHubRepoLocator(locator.trim());
+  let host: string;
+  let repoPath: string;
+  if (trimmed.startsWith('github:')) {
+    host = 'github.com';
+    repoPath = trimmed.slice('github:'.length);
+  } else if (/^(?:https?|ssh|git):\/\//i.test(trimmed)) {
+    let url: URL;
+    try {
+      url = new URL(trimmed);
+    } catch {
+      return null;
+    }
+    host = url.hostname;
+    repoPath = decodeURIComponent(url.pathname);
+  } else {
+    const scp = /^[^@\s/]+@([^:\s/]+):(.+)$/.exec(trimmed);
+    if (!scp) {
+      return null;
+    }
+    host = scp[1]!;
+    repoPath = scp[2]!;
+  }
+  repoPath = repoPath
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '')
+    .replace(/\.git$/i, '');
+  if (!host || !repoPath) {
+    return null;
+  }
+  host = host.toLowerCase();
+  // GitHub owner and repo names are case-insensitive.
+  if (host === 'github.com') {
+    repoPath = repoPath.toLowerCase();
+  }
+  return `${host}/${repoPath}`;
 }
 
 export function isGitRevision(value: string): boolean {

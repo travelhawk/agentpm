@@ -7,3 +7,4 @@ export * from './registry-client.js';
 // design (the deep-scan fallback re-finds entries a native layout already
 // matched), so rendering them directly double-counts skills.
 export { listInstallableEntries } from '@agentpm/adapters';
+export { sourceLabel } from './source-dedupe.js';
