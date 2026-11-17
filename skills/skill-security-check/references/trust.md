@@ -120,6 +120,27 @@ the skill, so every package in it becomes REJECT.
 pip takes the highest version across both. That is dependency confusion against a
 name that is trusted and pinned.
 
+## Trusted sources
+
+Some moving content is ordinary: the Homebrew installer at
+`raw.githubusercontent.com/Homebrew/install/HEAD/install.sh`, or a vendor's
+skill that loads more instructions from its own GitHub org. Rejecting those
+blocks well-known vendors for no gain. So `trustedSources` in
+`scripts/trust-data.mjs` lists:
+
+- **installers** — official installer scripts by exact address. `*` stands for
+  one path segment, such as a release tag. A query string never matches.
+- **publishers** — a domain (`neon.com`, subdomains included) or
+  `github.com/<org>`, which also covers that org on `raw.githubusercontent.com`
+  and `codeload.github.com`.
+
+A match lowers a moving-content REJECT (`url-mutable-host`) to REVIEW, as
+`url-trusted-source`. It never passes: a trusted vendor's branch can still
+change after the review, and a person still decides. The match runs on the
+normalised address, so `/Homebrew/../evil/` is not Homebrew. `--strict`
+ignores the list. Remote-instruction and exfiltration prose rules are not
+affected.
+
 ## The override file
 
 The bundled list lives in `scripts/trust-data.mjs`. It ships as a module rather
@@ -127,13 +148,18 @@ than as data under `references/`, because the sandboxed child may only read the
 script directory and the skill: a `references/trust.json` would raise
 `ERR_ACCESS_DENIED`, which the scanner turns into a REJECT.
 
-A local override may add or remove package names:
+A local override may add or remove package names, installers and publishers:
 
 ```json
 {
   "schema": 1,
-  "add": { "pypi": ["corp-internal-lib"], "npm": ["@corp/ui"] },
-  "remove": { "npm": ["event-stream"] }
+  "add": {
+    "pypi": ["corp-internal-lib"],
+    "npm": ["@corp/ui"],
+    "publishers": ["github.com/corp", "docs.corp.example"],
+    "installers": ["https://get.corp.example/install.sh"]
+  },
+  "remove": { "npm": ["event-stream"], "publishers": ["github.com/vercel"] }
 }
 ```
 

@@ -3187,6 +3187,55 @@ function analyseUrls(ctx, policy) {
         /^\/[^/]+\/[0-9a-f]+\/raw\/[0-9a-f]{40}\//i.test(url.pathname))
     );
   };
+  // A known installer or a trusted publisher, as listed in the policy. Runs on
+  // the normalised address only, like the commit pin: an address that
+  // normalisation changes (`/Homebrew/../evil/`) never matches.
+  const trustedSource = (h) => {
+    let url;
+    try {
+      url = new URL(h.value);
+    } catch {
+      return null;
+    }
+    const rawPath = h.value
+      .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/\\?#]*/i, '')
+      .split(/[?#]/)[0];
+    if (rawPath !== url.pathname && !(rawPath === '' && url.pathname === '/'))
+      return null;
+    const host = url.hostname.toLowerCase();
+    const segs = url.pathname.split('/').filter(Boolean);
+    const sources = trust.trustedSources ?? {};
+    for (const entry of sources.installers ?? []) {
+      let want;
+      try {
+        want = new URL(entry);
+      } catch {
+        continue;
+      }
+      const wantSegs = want.pathname.split('/').filter(Boolean);
+      if (
+        want.protocol === url.protocol &&
+        want.hostname.toLowerCase() === host &&
+        !url.search &&
+        wantSegs.length === segs.length &&
+        wantSegs.every((s, i) => s === '*' || s === segs[i])
+      )
+        return entry;
+    }
+    for (const entry of sources.publishers ?? []) {
+      const [eHost, org] = entry.toLowerCase().split('/');
+      if (!org) {
+        if (host === eHost || host.endsWith(`.${eHost}`)) return entry;
+        continue;
+      }
+      const hosts =
+        eHost === 'github.com'
+          ? ['github.com', 'raw.githubusercontent.com', 'codeload.github.com']
+          : [eHost];
+      if (hosts.includes(host) && segs[0]?.toLowerCase() === org) return entry;
+    }
+    return null;
+  };
   // What the skill does with the address itself. Attribution cannot argue with
   // any of these, so they are checked first.
   const isActedOn = (h) =>
@@ -3254,6 +3303,10 @@ function analyseUrls(ctx, policy) {
         rule = 'url-fetched';
         note =
           '; pinned to a commit, so the content cannot change, but it was not scanned';
+      } else if (trustedSource(hit)) {
+        severity = REVIEW;
+        rule = 'url-trusted-source';
+        note = `; a trusted source (${trustedSource(hit)}), but the content can change after review`;
       } else {
         severity = REJECT;
         rule = 'url-mutable-host';
@@ -3273,7 +3326,11 @@ function analyseUrls(ctx, policy) {
         (trust.mutablePaths ?? []).some((p) => hit.value.includes(p)) &&
         !isTemplate(hit) &&
         !isHeaderOnly(hit);
-      if (movingRef && (actedOn || isRemoteTarget(hit))) {
+      if (movingRef && (actedOn || isRemoteTarget(hit)) && trustedSource(hit)) {
+        severity = REVIEW;
+        rule = 'url-trusted-source';
+        note = `; a trusted source (${trustedSource(hit)}), but this address follows a branch, so its content can change after review`;
+      } else if (movingRef && (actedOn || isRemoteTarget(hit))) {
         // A moving branch ref on an ordinary host. `/blob/main/` renders a page
         // for a person to read, so it only counts once the skill fetches it.
         severity = REJECT;
@@ -4145,14 +4202,18 @@ function readOverride(file, notes) {
   }
 }
 
+// Override keys that extend the trusted sources instead of a package list.
+const SOURCE_KEYS = new Set(['installers', 'publishers']);
+
 function applyOverride(trust, override, strict, notes) {
   const packages = { ...trust.packages };
+  const sources = { ...(trust.trustedSources ?? {}) };
+  const listFor = (key) => (SOURCE_KEYS.has(key) ? sources : packages);
   // Removing trust can only make the scan stricter, so it always applies.
-  for (const [ecosystem, names] of Object.entries(override.remove)) {
+  for (const [key, names] of Object.entries(override.remove)) {
     const drop = new Set(names);
-    packages[ecosystem] = (packages[ecosystem] ?? []).filter(
-      (n) => !drop.has(n),
-    );
+    const target = listFor(key);
+    target[key] = (target[key] ?? []).filter((n) => !drop.has(n));
   }
   const added = [];
   const wants = Object.entries(override.add);
@@ -4161,12 +4222,13 @@ function applyOverride(trust, override, strict, notes) {
   } else {
     // An agent can write this file, and a skill's own prose can tell it to, so
     // every name trusted only through the override is named in the report.
-    for (const [ecosystem, names] of wants) {
-      packages[ecosystem] = [...(packages[ecosystem] ?? []), ...names];
-      for (const n of names) added.push(`${ecosystem}:${n}`);
+    for (const [key, names] of wants) {
+      const target = listFor(key);
+      target[key] = [...(target[key] ?? []), ...names];
+      for (const n of names) added.push(`${key}:${n}`);
     }
   }
-  return { trust: { ...trust, packages }, added };
+  return { trust: { ...trust, packages, trustedSources: sources }, added };
 }
 
 function policyHash(policy) {
@@ -4184,6 +4246,8 @@ function policyHash(policy) {
         docHosts: t.docHosts,
         contentHosts: t.contentHosts,
         mutablePaths: t.mutablePaths,
+        installers: [...(t.trustedSources?.installers ?? [])].sort(),
+        publishers: [...(t.trustedSources?.publishers ?? [])].sort(),
       }),
     )
     .digest('hex');
