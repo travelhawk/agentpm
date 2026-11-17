@@ -8,14 +8,23 @@ This repo uses a simple release workflow:
 - each release-facing cycle bumps the workspace package versions together
 - changelog and version bumps should land in the same commit when practical
 
-## [0.11.0] - Unreleased
+## [0.11.0] - 2026-11-17
 
 ### Added
 
+- `agentpm install --target claude,codex,generic` (or `--target all`) installs one source skill for several agents in one step. The skill does not need a native layout for each agent: a skill from a plain `skills/` folder is linked into every agent's skill folder, all pointing at the same checkout, so one update refreshes them all. Without `--target`, a skill keeps its own layout as before.
+- `agentpm source remove` no longer refuses when skills were installed from the source. It asks whether to keep the skills or remove them too (`--keep-installs`, `--remove-installs`). Detached installs link again when the same source is re-added.
+- Commands that need a choice (scope, source, agents) now explain what to pass instead of ending in a dead-end error.
+- The skill security check sends moving content from a known installer (Homebrew, nvm, rustup, uv, bun, deno, pnpm) or a trusted publisher to REVIEW instead of REJECT. `skill-trust.json` can add or remove installers and publishers.
 - `agentpm push` now surfaces **managed library skills** as push candidates. A skill brought under management with `agentpm adopt` (which lives in the canonical library, not the current workspace) can now be selected and published to a vault from any workspace — e.g. `agentpm push <skill-name>` or by ticking it in the interactive picker.
 
 ### Fixed
 
+- A new install no longer fails with `UNIQUE constraint failed: installs.target_path` when an install record for the same folder already exists under another id, for example from the same repository added under another address. The new record replaces the old one.
+- One source per Git repository: the same repository under another address (ssh, https, `github:`) stays one source, so its skills are not listed twice. Source names are readable. `agentpm doctor --fix` merges duplicate sources when there are no errors.
+- `agentpm adopt`, `remove` and `update` no longer lose or strand skills. `adopt` never adopts from AgentPM's cache and takes over same-scope installs.
+- The `github:owner/repo` shorthand is expanded before `git ls-remote`.
+- The skill security check no longer reports remote exfiltration for the word "website" in prose and closes several bypasses.
 - The interactive `agentpm push` picker no longer pre-selects every skill. Previously a bare `agentpm push` opened with all entries checked, so confirming pushed everything — effectively `--all`. The picker now starts with nothing selected so you opt into each skill (press `a` to select all, `n` for none). Skill selection in the interactive install flow behaves the same way; choosing which agents to install into still defaults to all.
 - `agentpm pull` is now version-aware: a skill whose content matches the library copy and is already linked into the chosen agents is left untouched and reported as skipped, instead of being recopied or triggering a replace prompt. The CLI now reports which skills were updated versus already up to date.
 - `agentpm push` deduplicates candidates by resolved content, so a managed skill that appears both as an on-disk link and a library install no longer aborts `--all` with a canonical-destination collision.
