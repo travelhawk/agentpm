@@ -440,6 +440,12 @@ export class AgentPmDatabase {
   }
 
   saveInstall(install: InstallRecord): InstallRecord {
+    // The folder an install lives in is unique. A record for the same folder
+    // under another id (for example from the same repository under another
+    // address) is replaced, because the new install now owns that folder.
+    this.database
+      .prepare('delete from installs where target_path = ? and id <> ?')
+      .run(install.targetPath, install.id);
     this.database
       .prepare(
         `

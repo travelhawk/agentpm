@@ -71,6 +71,14 @@ agentpm sync
 
 This creates or updates `agentpm.yaml`. Once the file exists, future project and workspace installs update the contract automatically.
 
+## Install One Skill For Several Agents
+
+```bash
+agentpm install --from company/skills --skill release-helper --global --target claude,codex,generic
+```
+
+The skill stays tracked by its source. Each agent gets a link in its own skill folder, all pointing at the same checkout, so `agentpm update` refreshes every agent at once. Use `--target all` for all three.
+
 ## Sync Skills Across Machines
 
 Use this when you want a canonical skills repository and multiple machines pulling from it.

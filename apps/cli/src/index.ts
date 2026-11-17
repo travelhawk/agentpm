@@ -10,6 +10,7 @@ import {
   registryLogin,
   registryLogout,
   registryWhoami,
+  sourceLabel,
   type InstallOptions,
   type ProviderInstalledSkillRecord,
   type ProviderSkillSearchResult,
@@ -342,6 +343,20 @@ function resolveScope(flags: {
     return 'workspace';
   }
   return undefined;
+}
+
+function resolveTargets(value?: string): InstallOptions['targets'] {
+  if (!value) {
+    return undefined;
+  }
+  const parts = value
+    .split(',')
+    .map((part) => part.trim().toLowerCase())
+    .filter(Boolean);
+  if (parts.includes('all')) {
+    return ['claude', 'codex', 'generic'];
+  }
+  return [...new Set(parts.map((part) => resolveTarget(part)!))];
 }
 
 function resolveTarget(value?: string): InstallOptions['target'] {
@@ -1198,16 +1213,22 @@ source.command('list').option('--json', 'Print machine-readable JSON').action(as
     Promise.resolve(service.listSources()),
   );
   if (flags.json) {
-    printSuccessJson('source.list', { sources });
+    printSuccessJson('source.list', {
+      sources: sources.map((item) => ({ ...item, label: sourceLabel(item) })),
+    });
     return;
   }
   if (sources.length === 0) {
     console.log('No sources configured.');
     return;
   }
-  for (const item of sources) {
-    console.log(`${item.id}  ${item.kind}  ${item.locator}`);
-  }
+  const labels = sources.map((item) => sourceLabel(item));
+  const width = Math.max(...labels.map((label) => label.length));
+  sources.forEach((item, index) => {
+    console.log(
+      `${style.bold(labels[index]!.padEnd(width))}  ${item.kind.padEnd(8)}  ${item.locator}  ${style.gray(item.id)}`,
+    );
+  });
 });
 
 addExamples(
@@ -1556,7 +1577,7 @@ addExamples(
     .option('--ref <ref>', 'Git branch, tag, or revision')
     .option(
       '--target <target>',
-      'Install only entries for codex, claude, or generic',
+      'Agents to install for: codex, claude, generic (comma separated) or all. A skill is linked into each agent skill folder',
     )
     .option(
       '--kind <kind>',
@@ -1589,7 +1610,7 @@ addExamples(
             all: flags.all,
             skills: flags.skill,
             ref: flags.ref ?? null,
-            target: resolveTarget(flags.target),
+            targets: resolveTargets(flags.target),
             kind: resolveKind(flags.kind),
             from: flags.from,
             addSource: flags.addSource,
@@ -1614,6 +1635,7 @@ addExamples(
     'agentpm install release-helper --project',
     'agentpm install --from travelhawk/skills-vault --skill release-helper --project',
     'agentpm install --from github:company/private-skills --all --target codex',
+    'agentpm install --from company/skills --skill release-helper --global --target claude,codex,generic',
   ],
 );
 
@@ -2086,8 +2108,12 @@ addExamples(
           return;
         }
 
-        const errors = issues.filter((issue) => issue.severity === 'error');
-        if (errors.length === 0) {
+        // Errors, plus the one warning doctor can fix: duplicate sources.
+        const fixable = issues.filter(
+          (issue) =>
+            issue.severity === 'error' || issue.code === 'source-duplicate',
+        );
+        if (fixable.length === 0) {
           if (flags.json) {
             printSuccessJson('doctor', {
               fixPlanned: false,
