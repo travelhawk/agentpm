@@ -12,18 +12,20 @@ decides how much noise you see. It never turns a REJECT into a PASS.
 
 ## Classes
 
-| Class                     | Condition                                                                                                                                                                | Severity                                   |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------ |
-| `integrity-pinned`        | An artifact hash travels with it: a lockfile `integrity`/`checksum`, `--hash=sha256:`, an image `@sha256:` digest, a 40-hex commit. Default registry, no index override. | INFO                                       |
-| `registry-pinned`         | Default registry, exact version by that ecosystem's grammar, install scripts disabled.                                                                                   | INFO                                       |
-| `registry-pinned-scripts` | As above, but install scripts still run.                                                                                                                                 | REVIEW                                     |
-| `trusted-unpinned`        | Known name, default registry, a range or a tag.                                                                                                                          | REVIEW                                     |
-| `unknown-name`            | Default registry, any pin, name not on the list.                                                                                                                         | REVIEW (REJECT under `--strict`)           |
-| `executes-fetched`        | `npx`, `bunx`, `uvx`, `pipx run`, `go run x@v`. Fetches and runs in one step, and the pin covers only the root package.                                                  | REVIEW (REJECT under `--strict`)           |
-| `name-near-miss`          | Looks like a known name but is not one itself.                                                                                                                           | REVIEW                                     |
-| `name-invalid`            | Illegal character set, not NFKC-stable, mixed scripts, or a collision after normalization.                                                                               | REJECT                                     |
-| `untrusted-source`        | A URL, a git target, a tarball, a path leaving the skill, an alias target, a custom index, or a container tag without a digest.                                          | REJECT                                     |
-| `poisoned`                | Any index override anywhere in the skill.                                                                                                                                | REJECT for **every** package in that skill |
+| Class                     | Condition                                                                                                                                    | Severity                                   |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `integrity-pinned`        | An artifact hash travels with it: a lockfile `integrity`/`checksum`, `--hash=sha256:`, a 40-hex commit. Default registry, no index override. | INFO                                       |
+| `registry-pinned`         | Default registry, exact version by that ecosystem's grammar, install scripts disabled.                                                       | INFO                                       |
+| `registry-pinned-scripts` | As above, but install scripts still run.                                                                                                     | REVIEW                                     |
+| `trusted-unpinned`        | Known name, default registry, a range or a tag.                                                                                              | REVIEW                                     |
+| `unknown-name`            | Default registry, any pin, name not on the list.                                                                                             | REVIEW (REJECT under `--strict`)           |
+| `executes-fetched`        | `npx`, `bunx`, `uvx`, `pipx run`, `go run x@v`. Fetches and runs in one step, and the pin covers only the root package.                      | REVIEW (REJECT under `--strict`)           |
+| `image-pinned`            | A container image pinned by `@sha256:` digest, on any registry. The content is fixed but was not analysed.                                   | REVIEW                                     |
+| `image-tag`               | A container image by tag, including `:latest` and no tag at all, on any registry. The owner can push new content under the same tag.         | REVIEW (REJECT under `--strict`)           |
+| `name-near-miss`          | Looks like a known name but is not one itself.                                                                                               | REVIEW                                     |
+| `name-invalid`            | Illegal character set, not NFKC-stable, mixed scripts, or a collision after normalization.                                                   | REJECT                                     |
+| `untrusted-source`        | A URL, a git target, a tarball, a path leaving the skill, an alias target, or a custom index.                                                | REJECT                                     |
+| `poisoned`                | Any index override anywhere in the skill.                                                                                                    | REJECT for **every** package in that skill |
 
 Two further outcomes are about where the package list lives:
 
@@ -52,6 +54,25 @@ fires on `requests`/`request`, `pillow`/`pillow-simd` and
 mostly combosquats (`python-requests`), which distance-1 misses anyway. REJECT is
 kept for the two cases with no false positives: a name that cannot legally be
 that package, and two names that collide after normalization.
+
+## Containers
+
+The registry is part of an image reference (`ghcr.io/org/app`), so naming one
+redirects no other install the way a custom package index does. What decides
+is the digest: a tag moves on Docker Hub exactly as it does on any other
+registry, and a digest is fixed on every registry. Neither was scanned, so
+both are a person's decision. Dockerfile stage names (`FROM build`) and
+`scratch` are not images and are skipped.
+
+## Pin hints
+
+Every finding whose content is not fixed yet (`image-tag`, `trusted-unpinned`,
+`unknown-name`, `executes-fetched`, `name-near-miss`) ends with how to pin it.
+`latest`, or no version at all, is called out first: it installs whatever is
+newest at install time, so the review covers nothing that will run later. The
+scanner is offline, so the hint names the command that looks the version up
+(`docker buildx imagetools inspect`, `npm view <pkg> version`,
+`pip index versions`, `go list -m -versions`) and never guesses a version.
 
 ## Pin grammar, per ecosystem
 

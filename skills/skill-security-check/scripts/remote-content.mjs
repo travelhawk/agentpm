@@ -225,7 +225,9 @@ const OUT_VERB = String.raw`${WORD_START}(?:send|sends|sending|upload|uploads|up
 const REMOTE_SINK = String.raw`(?:(?:a|an|the|our|this|that|my|your|their|some|any|remote|external|third[-\s]party|configured|given|following|below|above)\s+){0,3}(?:servers?|endpoints?|webhooks?|urls?|domains?|hosts?|apis?|addresses|inbox(?:es)?|e-?mail\s+address(?:es)?|pastebin|paste\s+sites?|gists?|buckets?|discord|telegram|ngrok|requestbin|collectors?|listeners?|c2|cloud\s+storage|ftp)`;
 const SECRETS = String.raw`(?:\.env\b|~\/\.ssh|\.ssh\/|\bid_(?:rsa|ed25519|ecdsa)\b|\bcredentials?\b|\bsecrets?\b|\bapi[\s_-]?keys?\b|\b(?:access|auth|bearer|github|npm|session)\s+tokens?\b|\bpasswords?\b|\bprivate\s+keys?\b|\bcookies\b|\.aws\b|\.netrc\b|\bkeychain\b|\bwallets?\b|\bseed\s+phrases?\b)`;
 const INSTR_NOUN = String.raw`(?:instructions?|rules?|guidance|guidelines?|prompts?|checklists?|polic(?:y|ies)|steps|directives?|tasks?|commands?|playbooks?|runbooks?|config(?:uration)?|skills?|SKILL\.md|scripts?|procedures?|workflows?|templates?)`;
-const REMOTE_PLACE = String.raw`(?:(?:the\s+)?(?:web|internet|server|url|link|domain|(?:web)?site|endpoint|api|remote|cloud|gist|pastebin|cdn|github|gitlab|repo(?:sitory)?\s+online)\b|online\b|remotely\b|on\s+the\s+(?:web|internet)\b)`;
+// `API routes` and `API handlers` are code in the user's own project ("call
+// `start()` from API routes"), not a remote place to load instructions from.
+const REMOTE_PLACE = String.raw`(?:(?:the\s+)?(?:web|internet|server|url|link|domain|(?:web)?site|endpoint|api(?!\s+(?:routes?|handlers?|layer|module|files?)\b)|remote|cloud|gist|pastebin|cdn|github|gitlab|repo(?:sitory)?\s+online)\b|online\b|remotely\b|on\s+the\s+(?:web|internet)\b)`;
 
 export const REMOTE_RULES = [
   {
@@ -243,7 +245,10 @@ export const REMOTE_RULES = [
     severity: REJECT,
     category: 'remote-content',
     re: new RegExp(
-      String.raw`${OUT_VERB}[^\n]{0,80}?${SECRETS}[^\n]{0,60}?\b(?:to|with|via|into|onto)\b|${SECRETS}[^\n]{0,60}?\b(?:to|into)\s+(?:the\s+)?(?:support|team|admin|maintainers?|author|developer|us)\b`,
+      // A negation between the verb and the secret says the opposite: "share
+      // without exposing credentials". The second form needs a hand-over verb,
+      // or "each API key is attributed to the team" reads as exfiltration.
+      String.raw`${OUT_VERB}(?:(?!\b(?:without|never|not|no)\b)[^\n]){0,80}?${SECRETS}[^\n]{0,60}?\b(?:to|with|via|into|onto)\b|\b(?:give|hand|provide|pass|reveal|tell|send|paste|share|upload|forward|e-?mail)\b[^\n]{0,40}?${SECRETS}[^\n]{0,60}?\b(?:to|into)\s+(?:the\s+)?(?:support|team|admin|maintainers?|author|developer|us)\b`,
       'i',
     ),
     message: 'Tells the agent to send secrets or credential files somewhere',
