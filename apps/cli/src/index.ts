@@ -2093,8 +2093,12 @@ addExamples(
           return;
         }
 
-        const errors = issues.filter((issue) => issue.severity === 'error');
-        if (errors.length === 0) {
+        // Errors, plus the one warning doctor can fix: duplicate sources.
+        const fixable = issues.filter(
+          (issue) =>
+            issue.severity === 'error' || issue.code === 'source-duplicate',
+        );
+        if (fixable.length === 0) {
           if (flags.json) {
             printSuccessJson('doctor', {
               fixPlanned: false,
