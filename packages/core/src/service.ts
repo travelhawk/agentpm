@@ -1771,10 +1771,26 @@ export class AgentPmService {
           `Push cancelled: "${install.name}" has local edits that only exist in AgentPM's cache.`,
         );
       }
-      const adopted = await this.adopt(install.targetPath, {
-        agents: [install.adapter],
-        yes: true,
-      });
+      let adopted: Awaited<ReturnType<AgentPmService['adopt']>>;
+      try {
+        adopted = await this.adopt(install.targetPath, {
+          agents: [install.adapter],
+          yes: true,
+        });
+      } catch (error) {
+        if (warnings.length === 0 || !(error instanceof Error)) {
+          throw error;
+        }
+        // Earlier skills of this push were already moved: say so.
+        throw new AgentPmError(
+          [
+            error.message,
+            '',
+            'Already moved before this failed:',
+            ...warnings,
+          ].join(String.fromCharCode(10)),
+        );
+      }
       entry.sourcePath = adopted.libraryPath;
       warnings.push(
         `Moved "${install.name}" to the skill library before pushing, so its local edits are kept. It no longer updates from its source.`,
