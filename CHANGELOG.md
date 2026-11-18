@@ -14,7 +14,7 @@ This repo uses a simple release workflow:
 
 - `agentpm adopt` of a skill installed from a source no longer fails when the home or temp folder sits behind a link (macOS `/var`, a Windows short name). AgentPM did not recognize its own cache link there and refused to replace it. This was the cause of the failing macOS and Windows CI runs.
 - A skill installed from a source and then edited no longer loses its edits on `agentpm update`. The update warns, names `agentpm adopt <name>`, and skips the skill unless you confirm in a terminal (`--yes` does not answer).
-- `agentpm push` of an edited source install first moves it to the skill library, like `agentpm adopt`, so the edits are kept and the skill no longer updates from its source. An unedited install is pushed as before. Installs made before this version have no recorded baseline and are not checked.
+- `agentpm push` of an edited source install first moves it to the skill library, like `agentpm adopt`, so the edits are kept and the skill no longer updates from its source. An unedited install is pushed as before. Registry archive installs are covered too. Installs made before this version have no recorded baseline and are not checked. `push` stops, and changes nothing, when the library already holds a different skill of the same name.
 
 ## [0.11.0] - 2026-11-17
 

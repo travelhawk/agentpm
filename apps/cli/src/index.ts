@@ -1172,7 +1172,7 @@ skillsCmd
         (preview) =>
           preview.changed &&
           preview.nextLinkTarget &&
-          !preview.warnings.includes('Skipped by user.'),
+          !preview.warnings.some((warning) => warning.startsWith('Skipped')),
       ).length;
       console.log(
         `\n${symbols.success} ${style.bold('Update complete')} ${style.gray(`(${updatedCount} skills.sh item(s) updated)`)}\n`,
@@ -1723,7 +1723,7 @@ program
           (preview) =>
             preview.changed &&
             preview.nextLinkTarget &&
-            !preview.warnings.includes('Skipped by user.'),
+            !preview.warnings.some((warning) => warning.startsWith('Skipped')),
         ).length;
         console.log(
           `\n${symbols.success} ${style.bold('Update complete')} ${style.gray(`(${updatedCount} item(s) updated)`)}\n`,

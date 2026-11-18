@@ -6,6 +6,8 @@ import { describe, expect, test } from 'vitest';
 
 import { AgentPmService } from '@agentpm/core';
 
+import { findCacheInstallFor } from '../packages/core/src/install-edits';
+
 import {
   copyDir,
   git,
@@ -24,10 +26,16 @@ const GIT_ENV = {
 };
 
 // A skill installed from a git source: its files live in AgentPM's cache.
-async function setup() {
-  const homeDir = await makeTempDir('agentpm-edit-home-');
+async function setup(base?: string) {
+  const homeDir = base
+    ? path.join(base, 'home')
+    : await makeTempDir('agentpm-edit-home-');
   const repoDir = await makeTempDir('agentpm-edit-repo-');
-  const projectDir = await makeTempDir('agentpm-edit-project-');
+  const projectDir = base
+    ? path.join(base, 'project')
+    : await makeTempDir('agentpm-edit-project-');
+  await fs.mkdir(homeDir, { recursive: true });
+  await fs.mkdir(projectDir, { recursive: true });
   await copyDir(path.resolve('tests/fixtures/repos/generic'), repoDir);
   initFixtureGitRepo(repoDir);
 
@@ -73,7 +81,7 @@ describe('edited installs from a source', () => {
         const [preview] = await service.update({ names: ['skill-b'] });
         expect(preview!.changed).toBe(true);
         expect(preview!.localEdits).toBe(true);
-        expect(preview!.warnings.join('\n')).toMatch(/agentpm adopt skill-b/);
+        expect(preview!.warnings.join('\n')).toMatch(/agentpm adopt ".*skill-b"/);
 
         // --yes does not answer this one, and the test has no terminal.
         await service.update({ names: ['skill-b'], apply: true, yes: true });
@@ -177,4 +185,102 @@ describe('edited installs from a source', () => {
     },
     CI_TEST_TIMEOUT,
   );
+  test(
+    'installing again keeps the baseline, so earlier edits are still found',
+    async () => {
+      const { service, repoDir, skillFile } = await setup();
+      try {
+        await fs.appendFile(skillFile, '\nmy local edit\n');
+        // `sync` runs install for every entry again, over the edited files.
+        await service.install(['skill-b'], {
+          scope: 'project',
+          target: 'generic',
+        });
+        await publishUpstreamChange(repoDir);
+
+        const [preview] = await service.update({ names: ['skill-b'] });
+        expect(preview!.localEdits).toBe(true);
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'push stops when the library has a different skill of that name, and keeps the edits',
+    async () => {
+      const { service, homeDir, install, skillFile } = await setup();
+      const remoteDir = await makeTempDir('agentpm-edit-remote-');
+      const remoteRepo = path.join(remoteDir, 'skills.git');
+      git(remoteDir, 'init', '--bare', remoteRepo);
+      try {
+        await writeFile(
+          path.join(homeDir, 'skills', 'skill-b', 'SKILL.md'),
+          '# OLD LIBRARY COPY\n',
+        );
+        await fs.appendFile(skillFile, '\nmy local edit\n');
+
+        await expect(
+          service.push({ target: remoteRepo, path: 'skill-b' }),
+        ).rejects.toThrow(/already exists in the AgentPM library/);
+
+        // Nothing moved: the edits are still in the install.
+        expect(await fs.readFile(skillFile, 'utf8')).toContain('my local edit');
+        expect(service.listInstalls()[0]!.linkTarget).toBe(install.linkTarget);
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'adopt works when the home and project folders sit behind a link',
+    async () => {
+      // Like macOS /var -> /private/var or a Windows short name: the real path
+      // of every folder differs from the one AgentPM was given.
+      const realBase = await makeTempDir('agentpm-edit-real-');
+      const aliasParent = await makeTempDir('agentpm-edit-alias-');
+      const alias = path.join(aliasParent, 'alias');
+      await fs.symlink(realBase, alias, 'junction');
+      const { service, install } = await setup(alias);
+      try {
+        await service.adopt(install.targetPath, {
+          agents: ['claude'],
+          yes: true,
+        });
+        const installs = service.listInstalls();
+        expect(installs.map((entry) => entry.adapter).sort()).toEqual([
+          'claude',
+          'generic',
+        ]);
+        expect(installs.every((entry) => entry.metadata.library === true)).toBe(
+          true,
+        );
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test('the install in the current scope wins when installs share a cache folder', async () => {
+    const root = await makeTempDir('agentpm-edit-shared-');
+    const cacheDir = path.join(root, 'cache');
+    const release = path.join(cacheDir, 'repos', 'k', 'r', 'skill-b');
+    await fs.mkdir(release, { recursive: true });
+    const fake = (scopeRoot: string) =>
+      ({ linkTarget: release, scopeRoot }) as never;
+    const globalInstall = fake(path.join(root, 'home'));
+    const projectInstall = fake(path.join(root, 'project'));
+
+    const found = await findCacheInstallFor(
+      release,
+      cacheDir,
+      [globalInstall, projectInstall],
+      path.join(root, 'project', 'sub'),
+    );
+    expect(found).toBe(projectInstall);
+  });
 });

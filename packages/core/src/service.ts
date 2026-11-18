@@ -27,6 +27,7 @@ import { AgentPmDatabase } from '@agentpm/db';
 import {
   findCacheInstallFor,
   hasLocalEdits,
+  isCacheBacked,
   signatureMetadata,
 } from './install-edits.js';
 import {
@@ -990,9 +991,14 @@ export class AgentPmService {
               ...(prepared.archive
                 ? { archive: true, archiveVersion: prepared.archive.version }
                 : {}),
-              ...(prepared.contentKind === 'local'
-                ? {}
-                : await signatureMetadata(linkTarget)),
+              ...(prepared.contentKind !== 'local' || prepared.archive
+                ? await signatureMetadata(
+                    linkTarget,
+                    this.db
+                      .listInstallsByName(mapping.name)
+                      .find((existing) => existing.id === installId),
+                  )
+                : {}),
             },
             createdAt: nowIso(),
             updatedAt: nowIso(),
@@ -1204,13 +1210,17 @@ export class AgentPmService {
     for (const preview of previews) {
       if (
         preview.changed &&
-        preview.install.contentKind !== 'local' &&
+        isCacheBacked(preview.install) &&
         (await hasLocalEdits(preview.install))
       ) {
         preview.localEdits = true;
+        // `adopt` takes a skill folder, not a plugin, so a plugin has no way
+        // to keep its edits.
         preview.warnings.push(
           `"${preview.install.name}" has local edits that this update would replace. ` +
-            `Keep them first: agentpm adopt ${preview.install.name}`,
+            (this.isPluginInstall(preview.install)
+              ? 'Plugins cannot be kept this way: copy your edits somewhere safe first.'
+              : `Keep them first: agentpm adopt "${preview.install.targetPath}"`),
         );
       }
     }
@@ -1300,13 +1310,12 @@ export class AgentPmService {
           linkTarget: preview.nextLinkTarget,
           sourceRelativePath: nextSourceRelativePath,
           installedRevision: preview.candidateRevision,
-          metadata:
-            preview.install.contentKind === 'local'
-              ? preview.install.metadata
-              : {
-                  ...preview.install.metadata,
-                  ...(await signatureMetadata(preview.nextLinkTarget)),
-                },
+          metadata: isCacheBacked(preview.install)
+            ? {
+                ...preview.install.metadata,
+                ...(await signatureMetadata(preview.nextLinkTarget)),
+              }
+            : preview.install.metadata,
           updatedAt: nowIso(),
         });
 
@@ -1669,13 +1678,23 @@ export class AgentPmService {
       : await this.adoptEditedCacheEntries(entries);
 
     if (target.kind === 'git') {
-      const result = await this.pushToGit(
-        target.locator,
-        entries,
-        options.message,
-        options.dryRun,
-      );
-      return { ...result, warnings: [...adoptWarnings, ...result.warnings] };
+      try {
+        const result = await this.pushToGit(
+          target.locator,
+          entries,
+          options.message,
+          options.dryRun,
+        );
+        return { ...result, warnings: [...adoptWarnings, ...result.warnings] };
+      } catch (error) {
+        if (adoptWarnings.length === 0 || !(error instanceof Error)) {
+          throw error;
+        }
+        // The skill was already moved, so say so: nothing else reports it.
+        throw new AgentPmError(
+          `${error.message}\n\n${adoptWarnings.join('\n')}`,
+        );
+      }
     }
 
     if (target.kind === 'registry') {
@@ -1696,12 +1715,21 @@ export class AgentPmService {
   ): Promise<string[]> {
     const warnings: string[] = [];
     for (const entry of entries) {
+      // `adopt` moves skill folders; a plugin or agent is pushed as it is.
+      if (entry.kind !== 'skill') {
+        continue;
+      }
       const install = await findCacheInstallFor(
         entry.sourcePath,
         this.paths.cacheDir,
         this.db.listInstalls(),
+        this.cwd,
       );
-      if (!install || !(await hasLocalEdits(install))) {
+      if (
+        !install ||
+        this.isPluginInstall(install) ||
+        !(await hasLocalEdits(install))
+      ) {
         continue;
       }
       if (
@@ -2976,11 +3004,24 @@ export class AgentPmService {
     if (originIsLink) {
       await this.assertLinkOriginIsAdoptable(name, contentPath);
     }
+    const originRealPath = originIsLink
+      ? ((await realpathOrNull(contentPath)) ?? contentPath)
+      : contentPath;
+    const originIsLibraryLink =
+      originIsLink &&
+      isWithinDirectory(
+        (await realpathOrNull(this.paths.skillsLibraryDir)) ??
+          this.paths.skillsLibraryDir,
+        originRealPath,
+      );
 
     if (await pathExists(libraryPath)) {
-      if (!originIsLink) {
+      // A link into the cache (an install from a source) holds its own files,
+      // which may differ from the library copy, so it is compared like a
+      // folder. A link to the library itself is the library copy.
+      if (!originIsLink || !originIsLibraryLink) {
         const [originRevision, libraryRevision] = await Promise.all([
-          computeTreeSignature(contentPath),
+          computeTreeSignature(originRealPath),
           computeTreeSignature(libraryPath),
         ]);
         if (originRevision !== libraryRevision) {

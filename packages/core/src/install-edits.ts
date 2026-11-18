@@ -12,10 +12,32 @@ import type { InstallRecord } from '@agentpm/shared';
  */
 const SIGNATURE_KEY = 'installedSignature';
 
-/** Metadata to store with an install whose files live in the cache. */
+/**
+ * True when the install's files are a copy in AgentPM's cache. A registry
+ * archive install reports `contentKind: 'local'` but is cached the same way.
+ */
+export function isCacheBacked(install: InstallRecord): boolean {
+  return install.contentKind !== 'local' || install.metadata.archive === true;
+}
+
+/**
+ * Metadata to store with an install whose files live in the cache. When the
+ * same install already exists on the same files, its baseline is kept: the
+ * files may have been edited since, and hashing them now would make the edits
+ * look like the original.
+ */
 export async function signatureMetadata(
   linkTarget: string,
+  previous?: InstallRecord | null,
 ): Promise<Record<string, string>> {
+  const kept = previous?.metadata[SIGNATURE_KEY];
+  if (
+    previous &&
+    previous.linkTarget === linkTarget &&
+    typeof kept === 'string'
+  ) {
+    return { [SIGNATURE_KEY]: kept };
+  }
   const signature = await computeTreeSignature(linkTarget).catch(() => null);
   return signature ? { [SIGNATURE_KEY]: signature } : {};
 }
@@ -36,11 +58,16 @@ export async function hasLocalEdits(install: InstallRecord): Promise<boolean> {
   return current !== null && current !== recorded;
 }
 
-/** The install whose cache folder `contentPath` resolves into, if any. */
+/**
+ * The install whose cache folder `contentPath` resolves into, if any. Several
+ * installs can share one cache folder (other scopes, other agents), so one in
+ * the scope of `cwd` wins.
+ */
 export async function findCacheInstallFor(
   contentPath: string,
   cacheDir: string,
   installs: InstallRecord[],
+  cwd: string,
 ): Promise<InstallRecord | null> {
   const real = await realpathOrNull(contentPath);
   const realCache = (await realpathOrNull(cacheDir)) ?? cacheDir;
@@ -50,10 +77,15 @@ export async function findCacheInstallFor(
   ) {
     return null;
   }
+  const matches: InstallRecord[] = [];
   for (const install of installs) {
     if ((await realpathOrNull(install.linkTarget)) === real) {
-      return install;
+      matches.push(install);
     }
   }
-  return null;
+  return (
+    matches.find((install) => isWithinDirectory(install.scopeRoot, cwd)) ??
+    matches[0] ??
+    null
+  );
 }
