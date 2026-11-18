@@ -384,6 +384,8 @@ export interface UpdatePreview {
   risk: LayoutMigrationRisk;
   warnings: string[];
   nextLinkTarget: string | null;
+  /** The installed files were edited; applying the update would replace them. */
+  localEdits?: boolean;
 }
 
 export type RuntimeContextLayer = 'global' | 'project' | 'temporary';
