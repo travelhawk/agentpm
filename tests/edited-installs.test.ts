@@ -208,6 +208,29 @@ describe('edited installs from a source', () => {
   );
 
   test(
+    'an install for another agent reuses the baseline of the shared cache copy',
+    async () => {
+      const { service, repoDir, skillFile } = await setup();
+      try {
+        await fs.appendFile(skillFile, '\nmy local edit\n');
+        // Same files, other agent: its baseline must be the original files.
+        await service.install(['skill-b'], {
+          scope: 'project',
+          target: 'claude',
+        });
+        await publishUpstreamChange(repoDir);
+
+        const previews = await service.update({ names: ['skill-b'] });
+        expect(previews.length).toBeGreaterThan(1);
+        expect(previews.every((preview) => preview.localEdits)).toBe(true);
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
     'push stops when the library has a different skill of that name, and keeps the edits',
     async () => {
       const { service, homeDir, install, skillFile } = await setup();

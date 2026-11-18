@@ -994,9 +994,20 @@ export class AgentPmService {
               ...(prepared.contentKind !== 'local' || prepared.archive
                 ? await signatureMetadata(
                     linkTarget,
+                    // Any install on these files knows their original state,
+                    // not only this agent's earlier install.
                     this.db
                       .listInstallsByName(mapping.name)
-                      .find((existing) => existing.id === installId),
+                      .filter(
+                        (existing) =>
+                          existing.linkTarget === linkTarget ||
+                          existing.id === installId,
+                      )
+                      .sort(
+                        (left, right) =>
+                          Number(right.id === installId) -
+                          Number(left.id === installId),
+                      )[0],
                   )
                 : {}),
             },
