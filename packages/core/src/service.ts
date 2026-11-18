@@ -28,6 +28,7 @@ import {
   findCacheInstallFor,
   hasLocalEdits,
   isCacheBacked,
+  isListedInManifest,
   signatureMetadata,
 } from './install-edits.js';
 import {
@@ -1725,6 +1726,8 @@ export class AgentPmService {
     entries: PushCandidate[],
   ): Promise<string[]> {
     const warnings: string[] = [];
+    const manifestInstalls =
+      (await loadProjectConfig(this.cwd))?.manifest.installs ?? [];
     for (const entry of entries) {
       // `adopt` moves skill folders; a plugin or agent is pushed as it is.
       if (entry.kind !== 'skill') {
@@ -1741,6 +1744,14 @@ export class AgentPmService {
         this.isPluginInstall(install) ||
         !(await hasLocalEdits(install))
       ) {
+        continue;
+      }
+      if (isListedInManifest(install, manifestInstalls)) {
+        // The project contract names the source, and `sync` would link the
+        // skill back to it. Leave the contract to the user.
+        warnings.push(
+          `"${install.name}" has local edits and is listed in agentpm.yaml, so AgentPM did not move it. The edits are pushed, but "agentpm update" or "agentpm sync" restores the source's files here. To keep them, point the agentpm.yaml entry at your own source.`,
+        );
         continue;
       }
       if (

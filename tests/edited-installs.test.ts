@@ -26,7 +26,7 @@ const GIT_ENV = {
 };
 
 // A skill installed from a git source: its files live in AgentPM's cache.
-async function setup(base?: string) {
+async function setup(base?: string, manifest = false) {
   const homeDir = base
     ? path.join(base, 'home')
     : await makeTempDir('agentpm-edit-home-');
@@ -36,6 +36,13 @@ async function setup(base?: string) {
     : await makeTempDir('agentpm-edit-project-');
   await fs.mkdir(homeDir, { recursive: true });
   await fs.mkdir(projectDir, { recursive: true });
+  if (manifest) {
+    await fs.writeFile(
+      path.join(projectDir, 'agentpm.yaml'),
+      'version: 1\nskills: []\n',
+      'utf8',
+    );
+  }
   await copyDir(path.resolve('tests/fixtures/repos/generic'), repoDir);
   initFixtureGitRepo(repoDir);
 
@@ -336,6 +343,59 @@ describe('edited installs from a source', () => {
     },
     CI_TEST_TIMEOUT,
   );
+
+  test(
+    'push does not move a skill that agentpm.yaml lists, and says why',
+    async () => {
+      const { service, install, skillFile } = await setup(undefined, true);
+      const remoteDir = await makeTempDir('agentpm-edit-remote-');
+      const remoteRepo = path.join(remoteDir, 'skills.git');
+      const verifyDir = path.join(remoteDir, 'verify');
+      git(remoteDir, 'init', '--bare', remoteRepo);
+      try {
+        await fs.appendFile(skillFile, '\nmy local edit\n');
+
+        const result = await service.push({
+          target: remoteRepo,
+          path: 'skill-b',
+        });
+        expect(result.warnings.join('\n')).toMatch(/listed in agentpm\.yaml/);
+        expect(service.listInstalls()[0]!.linkTarget).toBe(install.linkTarget);
+
+        // The edits are still published.
+        git(remoteDir, 'clone', remoteRepo, verifyDir);
+        expect(
+          await fs.readFile(
+            path.join(verifyDir, 'skills', 'skill-b', 'SKILL.md'),
+            'utf8',
+          ),
+        ).toContain('my local edit');
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test('the deepest scope wins when a global install sits above the project', async () => {
+    const root = await makeTempDir('agentpm-edit-nested-');
+    const cacheDir = path.join(root, 'cache');
+    const release = path.join(cacheDir, 'repos', 'k', 'r', 'skill-b');
+    await fs.mkdir(release, { recursive: true });
+    const fake = (scopeRoot: string) =>
+      ({ linkTarget: release, scopeRoot }) as never;
+    // The home folder contains the project, and is listed first.
+    const globalInstall = fake(root);
+    const projectInstall = fake(path.join(root, 'project'));
+
+    const found = await findCacheInstallFor(
+      release,
+      cacheDir,
+      [globalInstall, projectInstall],
+      path.join(root, 'project'),
+    );
+    expect(found).toBe(projectInstall);
+  });
 
   test('the install in the current scope wins when installs share a cache folder', async () => {
     const root = await makeTempDir('agentpm-edit-shared-');

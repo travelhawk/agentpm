@@ -17,6 +17,24 @@ const SIGNATURE_KEY = 'installedSignature';
  * True when the install's files are a copy in AgentPM's cache. A registry
  * archive install reports `contentKind: 'local'` but is cached the same way.
  */
+/**
+ * True when the project's `agentpm.yaml` lists this install. `sync` installs
+ * every listed entry from its source again, so moving the skill to the library
+ * would not last.
+ */
+export function isListedInManifest(
+  install: InstallRecord,
+  manifestInstalls: Array<{ name: string; items: string[] }>,
+): boolean {
+  return (
+    install.scope !== 'global' &&
+    manifestInstalls.some(
+      (entry) =>
+        entry.name === install.name || entry.items.includes(install.name),
+    )
+  );
+}
+
 export function isCacheBacked(install: InstallRecord): boolean {
   return install.contentKind !== 'local' || install.metadata.archive === true;
 }
@@ -89,9 +107,10 @@ export async function findCacheInstallFor(
       matches.push(install);
     }
   }
-  return (
-    matches.find((install) => isWithinDirectory(install.scopeRoot, cwd)) ??
-    matches[0] ??
-    null
-  );
+  // The deepest scope root wins: a global install (the home folder) contains
+  // every project under it, but the project's own install is the closer one.
+  const inScope = matches
+    .filter((install) => isWithinDirectory(install.scopeRoot, cwd))
+    .sort((left, right) => right.scopeRoot.length - left.scopeRoot.length);
+  return inScope[0] ?? matches[0] ?? null;
 }
