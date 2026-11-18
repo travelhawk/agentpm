@@ -1,5 +1,8 @@
+import { createHash } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+
 import {
-  computeTreeSignature,
   isWithinDirectory,
   pathExists,
   realpathOrNull,
@@ -12,6 +15,42 @@ import type { InstallRecord } from '@agentpm/shared';
  * when it creates the install, so it can tell later whether they were edited.
  */
 const SIGNATURE_KEY = 'installedSignature';
+
+// Left out of the edit signature: version control data, installed packages and
+// files an interpreter or the OS writes. Everything else the source ships, such
+// as a committed `dist/`, counts: an edit there is an edit.
+const SIGNATURE_IGNORED = new Set([
+  '.git',
+  'node_modules',
+  '__pycache__',
+  '.DS_Store',
+]);
+
+/** A hash of every shipped file in the folder, by relative path and content. */
+async function editSignature(root: string): Promise<string> {
+  const files: string[] = [];
+  async function visit(dir: string): Promise<void> {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      if (SIGNATURE_IGNORED.has(entry.name)) {
+        continue;
+      }
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await visit(full);
+      } else if (entry.isFile()) {
+        files.push(full);
+      }
+    }
+  }
+  await visit(root);
+  files.sort();
+  const hash = createHash('sha1');
+  for (const file of files) {
+    hash.update(path.relative(root, file).split(path.sep).join('/'));
+    hash.update(await fs.readFile(file));
+  }
+  return hash.digest('hex');
+}
 
 /**
  * True when the install's files are a copy in AgentPM's cache. A registry
@@ -57,7 +96,7 @@ export async function signatureMetadata(
   ) {
     return { [SIGNATURE_KEY]: kept };
   }
-  const signature = await computeTreeSignature(linkTarget).catch(() => null);
+  const signature = await editSignature(linkTarget).catch(() => null);
   return signature ? { [SIGNATURE_KEY]: signature } : {};
 }
 
@@ -76,9 +115,7 @@ export async function hasLocalEdits(install: InstallRecord): Promise<boolean> {
   if (!(await pathExists(install.linkTarget))) {
     return false;
   }
-  const current = await computeTreeSignature(install.linkTarget).catch(
-    () => null,
-  );
+  const current = await editSignature(install.linkTarget).catch(() => null);
   return current !== null && current !== recorded;
 }
 

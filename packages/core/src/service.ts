@@ -1685,35 +1685,36 @@ export class AgentPmService {
       };
     }
 
+    // Check the target before anything changes: adopting an install is not
+    // undone by a push that was bound to fail.
+    if (target.kind === 'registry') {
+      throw new AgentPmError('Registry push is not implemented yet.');
+    }
+    if (target.kind !== 'git') {
+      throw new AgentPmError(`Unsupported push target kind: ${target.kind}`);
+    }
+
     const adoptWarnings = options.dryRun
       ? []
       : await this.adoptEditedCacheEntries(entries);
 
-    if (target.kind === 'git') {
-      try {
-        const result = await this.pushToGit(
-          target.locator,
-          entries,
-          options.message,
-          options.dryRun,
-        );
-        return { ...result, warnings: [...adoptWarnings, ...result.warnings] };
-      } catch (error) {
-        if (adoptWarnings.length === 0 || !(error instanceof Error)) {
-          throw error;
-        }
-        // The skill was already moved, so say so: nothing else reports it.
-        throw new AgentPmError(
-          `${error.message}\n\n${adoptWarnings.join('\n')}`,
-        );
+    try {
+      const result = await this.pushToGit(
+        target.locator,
+        entries,
+        options.message,
+        options.dryRun,
+      );
+      return { ...result, warnings: [...adoptWarnings, ...result.warnings] };
+    } catch (error) {
+      if (adoptWarnings.length === 0 || !(error instanceof Error)) {
+        throw error;
       }
+      // The skill was already moved, so say so: nothing else reports it.
+      throw new AgentPmError(
+        `${error.message}\n\n${adoptWarnings.join('\n')}`,
+      );
     }
-
-    if (target.kind === 'registry') {
-      throw new AgentPmError('Registry push is not implemented yet.');
-    }
-
-    throw new AgentPmError(`Unsupported push target kind: ${target.kind}`);
   }
 
   /**

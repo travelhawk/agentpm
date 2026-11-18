@@ -345,6 +345,50 @@ describe('edited installs from a source', () => {
   );
 
   test(
+    'an edit inside a shipped dist folder counts as an edit',
+    async () => {
+      const { service, repoDir, install } = await setup();
+      try {
+        await writeFile(
+          path.join(install.targetPath, 'dist', 'run.js'),
+          'console.log("my change");\n',
+        );
+        await publishUpstreamChange(repoDir);
+
+        const [preview] = await service.update({ names: ['skill-b'] });
+        expect(preview!.changed).toBe(true);
+        expect(preview!.localEdits).toBe(true);
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'a push that must fail does not move the install first',
+    async () => {
+      const { service, install, skillFile } = await setup();
+      try {
+        await fs.appendFile(skillFile, '\nmy local edit\n');
+
+        await expect(
+          service.push({
+            target: 'registry:https://registry.invalid/index.json',
+            path: 'skill-b',
+          }),
+        ).rejects.toThrow(/Registry push is not implemented/);
+
+        expect(service.listInstalls()[0]!.linkTarget).toBe(install.linkTarget);
+        expect(await fs.readFile(skillFile, 'utf8')).toContain('my local edit');
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
     'push does not move a skill that agentpm.yaml lists, and says why',
     async () => {
       const { service, install, skillFile } = await setup(undefined, true);
