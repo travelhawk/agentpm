@@ -705,4 +705,67 @@ describe('install disambiguation on identical names', () => {
     },
     CI_TEST_TIMEOUT,
   );
+  test(
+    'update leaves an edited archive install alone instead of dropping the edits',
+    async () => {
+      const server = await startServer();
+      const token = server.bootstrap!.token;
+      const publisherEnv = {
+        AGENTPM_HOME: await makeTempDir('agentpm-pub-home-'),
+        AGENTPM_REGISTRY_TOKEN: token,
+      };
+      const skillDir = await makeSkillFixture('edit-skill', 'edit v1');
+      await publishSkillToRegistry({
+        registryUrl: server.url,
+        sourcePath: skillDir,
+        env: publisherEnv,
+      });
+
+      const service = new AgentPmService({
+        cwd: await makeTempDir('agentpm-project-'),
+        env: {
+          AGENTPM_HOME: await makeTempDir('agentpm-home-'),
+          AGENTPM_REGISTRY_TOKEN: token,
+        },
+      });
+      try {
+        await service.addSource(`registry:${server.url}/index.json`);
+        const [install] = await service.install(['edit-skill'], {
+          scope: 'project',
+          yes: true,
+          updateProjectConfig: false,
+        });
+        const skillFile = path.join(install!.targetPath, 'SKILL.md');
+        await fs.appendFile(skillFile, '\nmy local edit\n');
+
+        await writeFile(
+          path.join(skillDir, 'SKILL.md'),
+          '# edit-skill\n\nedit v2\n',
+        );
+        await publishSkillToRegistry({
+          registryUrl: server.url,
+          sourcePath: skillDir,
+          env: publisherEnv,
+        });
+        await service.refreshSources();
+
+        const [preview] = await service.update({ names: ['edit-skill'] });
+        expect(preview!.changed).toBe(true);
+        expect(preview!.localEdits).toBe(true);
+
+        // --yes does not answer, and the test has no terminal.
+        await service.update({
+          names: ['edit-skill'],
+          apply: true,
+          yes: true,
+        });
+        await expect(fs.readFile(skillFile, 'utf8')).resolves.toContain(
+          'my local edit',
+        );
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
 });

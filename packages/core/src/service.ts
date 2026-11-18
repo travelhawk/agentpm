@@ -25,6 +25,14 @@ import {
 } from '@agentpm/config';
 import { AgentPmDatabase } from '@agentpm/db';
 import {
+  editSignature,
+  findCacheInstallFor,
+  hasLocalEdits,
+  isCacheBacked,
+  isListedInManifest,
+  signatureMetadata,
+} from './install-edits.js';
+import {
   computeTreeSignature,
   copyTreeVerbatim,
   diffTrees,
@@ -985,6 +993,29 @@ export class AgentPmService {
               ...(prepared.archive
                 ? { archive: true, archiveVersion: prepared.archive.version }
                 : {}),
+              ...(prepared.contentKind !== 'local' || prepared.archive
+                ? await signatureMetadata(
+                    linkTarget,
+                    // Any install on these files knows their original state,
+                    // not only this agent's earlier install.
+                    this.db
+                      .listInstallsByName(mapping.name)
+                      .filter(
+                        (existing) =>
+                          existing.linkTarget === linkTarget ||
+                          existing.id === installId,
+                      )
+                      // A record with a baseline beats one without, even the
+                      // exact install: a legacy record would hash edited files.
+                      .sort(
+                        (left, right) =>
+                          Number(typeof right.metadata.installedSignature === 'string') -
+                            Number(typeof left.metadata.installedSignature === 'string') ||
+                          Number(right.id === installId) -
+                            Number(left.id === installId),
+                      )[0],
+                  )
+                : {}),
             },
             createdAt: nowIso(),
             updatedAt: nowIso(),
@@ -1193,6 +1224,24 @@ export class AgentPmService {
       }
     }
 
+    for (const preview of previews) {
+      if (
+        preview.changed &&
+        isCacheBacked(preview.install) &&
+        (await hasLocalEdits(preview.install))
+      ) {
+        preview.localEdits = true;
+        // `adopt` takes a skill folder, not a plugin, so a plugin has no way
+        // to keep its edits.
+        preview.warnings.push(
+          `"${preview.install.name}" has local edits that this update would replace. ` +
+            (this.isPluginInstall(preview.install)
+              ? 'Plugins cannot be kept this way: copy your edits somewhere safe first.'
+              : `Keep them first: agentpm adopt "${preview.install.targetPath}"`),
+        );
+      }
+    }
+
     return previews;
   }
 
@@ -1233,6 +1282,21 @@ export class AgentPmService {
         }
       }
 
+      if (preview.localEdits) {
+        // --yes does not answer this one: the update replaces the edited files
+        // with the source's, so only an explicit answer in a terminal does.
+        const confirmed =
+          canPrompt(this.prompts, 'confirm') &&
+          (await this.prompts.confirm(
+            `"${preview.install.name}" has local edits. Update and lose them?`,
+            preview.warnings,
+          ));
+        if (!confirmed) {
+          preview.warnings.push('Skipped: local edits would be lost.');
+          continue;
+        }
+      }
+
       try {
         await removeManagedLink(preview.install.targetPath);
         await ensureManagedLink(
@@ -1263,6 +1327,12 @@ export class AgentPmService {
           linkTarget: preview.nextLinkTarget,
           sourceRelativePath: nextSourceRelativePath,
           installedRevision: preview.candidateRevision,
+          metadata: isCacheBacked(preview.install)
+            ? {
+                ...preview.install.metadata,
+                ...(await signatureMetadata(preview.nextLinkTarget)),
+              }
+            : preview.install.metadata,
           updatedAt: nowIso(),
         });
 
@@ -1620,20 +1690,114 @@ export class AgentPmService {
       };
     }
 
-    if (target.kind === 'git') {
-      return this.pushToGit(
+    // Check the target before anything changes: adopting an install is not
+    // undone by a push that was bound to fail.
+    if (target.kind === 'registry') {
+      throw new AgentPmError('Registry push is not implemented yet.');
+    }
+    if (target.kind !== 'git') {
+      throw new AgentPmError(`Unsupported push target kind: ${target.kind}`);
+    }
+
+    const adoptWarnings = options.dryRun
+      ? []
+      : await this.adoptEditedCacheEntries(entries);
+
+    try {
+      const result = await this.pushToGit(
         target.locator,
         entries,
         options.message,
         options.dryRun,
       );
+      return { ...result, warnings: [...adoptWarnings, ...result.warnings] };
+    } catch (error) {
+      if (adoptWarnings.length === 0 || !(error instanceof Error)) {
+        throw error;
+      }
+      // The skill was already moved, so say so: nothing else reports it.
+      throw new AgentPmError(
+        `${error.message}\n\n${adoptWarnings.join('\n')}`,
+      );
     }
+  }
 
-    if (target.kind === 'registry') {
-      throw new AgentPmError('Registry push is not implemented yet.');
+  /**
+   * An install from a source is a link into AgentPM's cache, so edits made to
+   * it sit in a folder the next `update` replaces. Before such a skill is
+   * pushed, move it to the skill library like `adopt` does: the edits are then
+   * kept, and the pushed files are the ones the agent reads.
+   */
+  private async adoptEditedCacheEntries(
+    entries: PushCandidate[],
+  ): Promise<string[]> {
+    const warnings: string[] = [];
+    const manifestInstalls =
+      (await loadProjectConfig(this.cwd))?.manifest.installs ?? [];
+    for (const entry of entries) {
+      // `adopt` moves skill folders; a plugin or agent is pushed as it is.
+      if (entry.kind !== 'skill') {
+        continue;
+      }
+      const install = await findCacheInstallFor(
+        entry.sourcePath,
+        this.paths.cacheDir,
+        this.db.listInstalls(),
+        this.cwd,
+      );
+      if (
+        !install ||
+        this.isPluginInstall(install) ||
+        !(await hasLocalEdits(install))
+      ) {
+        continue;
+      }
+      if (isListedInManifest(install, manifestInstalls)) {
+        // The project contract names the source, and `sync` would link the
+        // skill back to it. Leave the contract to the user.
+        warnings.push(
+          `"${install.name}" has local edits and is listed in agentpm.yaml, so AgentPM did not move it. The edits are pushed, but "agentpm update" or "agentpm sync" restores the source's files here. To keep them, point the agentpm.yaml entry at your own source.`,
+        );
+        continue;
+      }
+      if (
+        canPrompt(this.prompts, 'confirm') &&
+        !(await this.prompts.confirm(
+          `"${install.name}" has local edits and lives in AgentPM's cache. Move it to the skill library, so the edits are kept? It stops updating from its source.`,
+          [`Source: ${install.contentLocator}`],
+        ))
+      ) {
+        throw new AgentPmError(
+          `Push cancelled: "${install.name}" has local edits that only exist in AgentPM's cache.`,
+        );
+      }
+      let adopted: Awaited<ReturnType<AgentPmService['adopt']>>;
+      try {
+        adopted = await this.adopt(install.targetPath, {
+          agents: [install.adapter],
+          yes: true,
+        });
+      } catch (error) {
+        if (warnings.length === 0 || !(error instanceof Error)) {
+          throw error;
+        }
+        // Earlier skills of this push were already moved: say so.
+        throw new AgentPmError(
+          [
+            error.message,
+            '',
+            'Already moved before this failed:',
+            ...warnings,
+          ].join(String.fromCharCode(10)),
+        );
+      }
+      entry.sourcePath = adopted.libraryPath;
+      warnings.push(
+        `Moved "${install.name}" to the skill library before pushing, so its local edits are kept. It no longer updates from its source.`,
+        ...adopted.warnings,
+      );
     }
-
-    throw new AgentPmError(`Unsupported push target kind: ${target.kind}`);
+    return warnings;
   }
 
   private async resolvePushTarget(
@@ -2339,11 +2503,21 @@ export class AgentPmService {
     if (stat?.isSymbolicLink()) {
       const current = await realpathOrNull(linkPath);
       const next = (await realpathOrNull(linkTarget)) ?? path.resolve(linkTarget);
+      // `current` is a real path, so the managed folders count by their real
+      // path too: a temp or home folder behind a link (macOS `/var`, a Windows
+      // short name) would otherwise make AgentPM's own link look foreign.
+      let isManaged = false;
+      for (const managedDir of [
+        this.paths.cacheDir,
+        this.paths.skillsLibraryDir,
+      ]) {
+        const realDir = (await realpathOrNull(managedDir)) ?? managedDir;
+        isManaged ||=
+          isWithinDirectory(managedDir, current ?? '') ||
+          isWithinDirectory(realDir, current ?? '');
+      }
       const isStaleManagedLink =
-        current === null ||
-        (current !== next &&
-          (isWithinDirectory(this.paths.cacheDir, current) ||
-            isWithinDirectory(this.paths.skillsLibraryDir, current)));
+        current === null || (current !== next && isManaged);
       if (isStaleManagedLink) {
         await removeManagedLink(linkPath);
       }
@@ -2488,7 +2662,7 @@ export class AgentPmService {
       );
     const results = [];
     for (const install of siblings) {
-      const signature = await computeTreeSignature(install.linkTarget).catch(
+      const signature = await editSignature(install.linkTarget).catch(
         () => null,
       );
       results.push({
@@ -2874,12 +3048,25 @@ export class AgentPmService {
     if (originIsLink) {
       await this.assertLinkOriginIsAdoptable(name, contentPath);
     }
+    const originRealPath = originIsLink
+      ? ((await realpathOrNull(contentPath)) ?? contentPath)
+      : contentPath;
+    const originIsLibraryLink =
+      originIsLink &&
+      isWithinDirectory(
+        (await realpathOrNull(this.paths.skillsLibraryDir)) ??
+          this.paths.skillsLibraryDir,
+        originRealPath,
+      );
 
     if (await pathExists(libraryPath)) {
-      if (!originIsLink) {
+      // A link into the cache (an install from a source) holds its own files,
+      // which may differ from the library copy, so it is compared like a
+      // folder. A link to the library itself is the library copy.
+      if (!originIsLink || !originIsLibraryLink) {
         const [originRevision, libraryRevision] = await Promise.all([
-          computeTreeSignature(contentPath),
-          computeTreeSignature(libraryPath),
+          editSignature(originRealPath),
+          editSignature(libraryPath),
         ]);
         if (originRevision !== libraryRevision) {
           const conflict = `A different skill named "${name}" already exists in the AgentPM library.`;
@@ -2948,7 +3135,7 @@ export class AgentPmService {
       name,
       effectiveScopeRoot,
       libraryPath,
-      revision,
+      await editSignature(libraryPath),
       contentPath,
     );
     const explicitAgents = new Set(options.agents ?? []);
