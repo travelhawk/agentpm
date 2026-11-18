@@ -26,9 +26,13 @@ const SIGNATURE_IGNORED = new Set([
   '.DS_Store',
 ]);
 
-/** A hash of every shipped file in the folder, by relative path and content. */
-async function editSignature(root: string): Promise<string> {
+/**
+ * A hash of every shipped file in the folder, by relative path and content.
+ * A symbolic link counts by its target, so retargeting one is an edit.
+ */
+export async function editSignature(root: string): Promise<string> {
   const files: string[] = [];
+  const links: string[] = [];
   async function visit(dir: string): Promise<void> {
     for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
       if (SIGNATURE_IGNORED.has(entry.name)) {
@@ -39,6 +43,8 @@ async function editSignature(root: string): Promise<string> {
         await visit(full);
       } else if (entry.isFile()) {
         files.push(full);
+      } else if (entry.isSymbolicLink()) {
+        links.push(full);
       }
     }
   }
@@ -48,6 +54,11 @@ async function editSignature(root: string): Promise<string> {
   for (const file of files) {
     hash.update(path.relative(root, file).split(path.sep).join('/'));
     hash.update(await fs.readFile(file));
+  }
+  links.sort();
+  for (const link of links) {
+    hash.update(`link:${path.relative(root, link).split(path.sep).join('/')}`);
+    hash.update(await fs.readlink(link));
   }
   return hash.digest('hex');
 }

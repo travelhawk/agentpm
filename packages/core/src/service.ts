@@ -25,6 +25,7 @@ import {
 } from '@agentpm/config';
 import { AgentPmDatabase } from '@agentpm/db';
 import {
+  editSignature,
   findCacheInstallFor,
   hasLocalEdits,
   isCacheBacked,
@@ -3044,8 +3045,8 @@ export class AgentPmService {
       // folder. A link to the library itself is the library copy.
       if (!originIsLink || !originIsLibraryLink) {
         const [originRevision, libraryRevision] = await Promise.all([
-          computeTreeSignature(originRealPath),
-          computeTreeSignature(libraryPath),
+          editSignature(originRealPath),
+          editSignature(libraryPath),
         ]);
         if (originRevision !== libraryRevision) {
           const conflict = `A different skill named "${name}" already exists in the AgentPM library.`;

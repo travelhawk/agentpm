@@ -6,7 +6,7 @@ import { describe, expect, test } from 'vitest';
 
 import { AgentPmService } from '@agentpm/core';
 
-import { findCacheInstallFor } from '../packages/core/src/install-edits';
+import { editSignature, findCacheInstallFor } from '../packages/core/src/install-edits';
 
 import {
   copyDir,
@@ -364,6 +364,55 @@ describe('edited installs from a source', () => {
     },
     CI_TEST_TIMEOUT,
   );
+
+  test(
+    'push stops when the library copy differs only inside a dist folder',
+    async () => {
+      const { service, homeDir, install, skillFile } = await setup();
+      const remoteDir = await makeTempDir('agentpm-edit-remote-');
+      const remoteRepo = path.join(remoteDir, 'skills.git');
+      git(remoteDir, 'init', '--bare', remoteRepo);
+      try {
+        const original = await fs.readFile(skillFile, 'utf8');
+        await writeFile(
+          path.join(homeDir, 'skills', 'skill-b', 'SKILL.md'),
+          original,
+        );
+        await writeFile(
+          path.join(homeDir, 'skills', 'skill-b', 'dist', 'run.js'),
+          '// library copy',
+        );
+        await writeFile(
+          path.join(install.targetPath, 'dist', 'run.js'),
+          '// my copy',
+        );
+
+        await expect(
+          service.push({ target: remoteRepo, path: 'skill-b' }),
+        ).rejects.toThrow(/already exists in the AgentPM library/);
+        expect(service.listInstalls()[0]!.linkTarget).toBe(install.linkTarget);
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test('retargeting a symbolic link changes the edit signature', async () => {
+    const root = await makeTempDir('agentpm-edit-links-');
+    const one = path.join(root, 'one');
+    const two = path.join(root, 'two');
+    await fs.mkdir(one);
+    await fs.mkdir(two);
+    const skill = path.join(root, 'skill');
+    await writeFile(path.join(skill, 'SKILL.md'), '# skill');
+    const link = path.join(skill, 'shared');
+    await fs.symlink(one, link, 'junction');
+    const before = await editSignature(skill);
+    await fs.rm(link, { recursive: true, force: true });
+    await fs.symlink(two, link, 'junction');
+    expect(await editSignature(skill)).not.toBe(before);
+  });
 
   test(
     'a push that must fail does not move the install first',
