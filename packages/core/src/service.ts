@@ -1005,10 +1005,14 @@ export class AgentPmService {
                           existing.linkTarget === linkTarget ||
                           existing.id === installId,
                       )
+                      // A record with a baseline beats one without, even the
+                      // exact install: a legacy record would hash edited files.
                       .sort(
                         (left, right) =>
+                          Number(typeof right.metadata.installedSignature === 'string') -
+                            Number(typeof left.metadata.installedSignature === 'string') ||
                           Number(right.id === installId) -
-                          Number(left.id === installId),
+                            Number(left.id === installId),
                       )[0],
                   )
                 : {}),
@@ -2642,7 +2646,7 @@ export class AgentPmService {
       );
     const results = [];
     for (const install of siblings) {
-      const signature = await computeTreeSignature(install.linkTarget).catch(
+      const signature = await editSignature(install.linkTarget).catch(
         () => null,
       );
       results.push({
@@ -3115,7 +3119,7 @@ export class AgentPmService {
       name,
       effectiveScopeRoot,
       libraryPath,
-      revision,
+      await editSignature(libraryPath),
       contentPath,
     );
     const explicitAgents = new Set(options.agents ?? []);

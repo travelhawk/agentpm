@@ -415,6 +415,69 @@ describe('edited installs from a source', () => {
   });
 
   test(
+    'a sibling install that differs only inside dist is left unchanged',
+    async () => {
+      const { service, projectDir, install } = await setup();
+      try {
+        const claudeCopy = path.join(projectDir, '.claude', 'skills', 'skill-b');
+        await copyDir(install.linkTarget, claudeCopy);
+        await writeFile(
+          path.join(install.targetPath, 'dist', 'run.js'),
+          '// only in the generic install',
+        );
+
+        const result = await service.adopt(claudeCopy, { agents: [], yes: true });
+
+        expect(result.warnings.join(String.fromCharCode(10))).toMatch(
+          /Left the generic install of "skill-b" unchanged/,
+        );
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'a re-install takes the baseline of a signed sibling over its own unsigned record',
+    async () => {
+      const { service, skillFile } = await setup();
+      try {
+        const [claude] = await service.install(['skill-b'], {
+          scope: 'project',
+          target: 'claude',
+        });
+        const signed = service
+          .listInstalls()
+          .find((entry) => entry.adapter === 'generic')!;
+        // A record from before baselines existed.
+        const legacy = { ...claude!.metadata };
+        delete legacy.installedSignature;
+        const internals = service as unknown as {
+          db: { saveInstall(record: typeof claude): unknown };
+        };
+        internals.db.saveInstall({ ...claude!, metadata: legacy });
+        await fs.appendFile(skillFile, 'my local edit');
+
+        await service.install(['skill-b'], {
+          scope: 'project',
+          target: 'claude',
+        });
+
+        const again = service
+          .listInstalls()
+          .find((entry) => entry.adapter === 'claude')!;
+        expect(again.metadata.installedSignature).toBe(
+          signed.metadata.installedSignature,
+        );
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
     'a push that must fail does not move the install first',
     async () => {
       const { service, install, skillFile } = await setup();
