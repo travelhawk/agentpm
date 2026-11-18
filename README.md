@@ -58,8 +58,8 @@ agentpm quickstart --json
 Use this when you want one skill on this machine or in the current repo.
 
 ```bash
-agentpm skills search typescript
-agentpm skills install typescript --project
+agentpm source add company/private-skills
+agentpm install my-skill --project
 agentpm list
 ```
 
@@ -150,7 +150,7 @@ agentpm doctor --fix --yes --json
 
 ## What AgentPM Does Well
 
-- `📦` Install skills from Git repositories, local folders, static registries, and the public `skills.sh` bridge.
+- `📦` Install skills from Git repositories, local folders, static registries. A public `skills.sh` bridge exists but is off by default (see [Public Skills](#public-skills-opt-in)).
 - `🔌` Install Claude Code **and** Codex plugins (`.claude-plugin/` / `.codex-plugin/` manifests and marketplace repos) into a managed local marketplace each host consumes natively.
 - `🏠` Run your own registry with `agentpm registry serve`: users, API tokens, public/private skills, publish/install, and a built-in web UI for curation.
 - `🧭` Keep the CLI thin while respecting native agent layouts instead of rewriting them.
@@ -228,16 +228,19 @@ skills:
 
 String entries are shorthand. Object entries bind a project skill to a configured source, optional Git ref or resolved revision, runtime target, install scope, and one or more native skill items.
 
-### Public Bridge
+### Public Skills (opt-in)
 
-Use the public bridge when you do not have your own team source yet:
+AgentPM is built for private, team, and company skills. The public `skills.sh` bridge is **off by default**, because installing public skills is a supply-chain risk. For public skills, prefer `npx skills add` or another skill manager.
+
+If you still want the bridge, turn it on with an environment variable:
 
 ```bash
+export AGENTPM_ENABLE_SKILLS_SH=1   # PowerShell: $env:AGENTPM_ENABLE_SKILLS_SH = '1'
 agentpm skills search typescript
 agentpm skills install wshobson/agents@typescript-advanced-types --project
-agentpm skills list
-agentpm skills update --yes
 ```
+
+Without the variable, `agentpm skills search/install/update` stop with an explanation. `skills list` and `skills remove` always work, so you can clean up existing installs.
 
 ### Canonical Push / Pull / Adopt
 

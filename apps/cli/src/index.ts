@@ -927,7 +927,7 @@ const skillsCmd = addExamples(
   program
     .command('skills')
     .description(
-      'Search and import public skills through the skills.sh bridge',
+      'Search and import public skills through the skills.sh bridge (off by default, set AGENTPM_ENABLE_SKILLS_SH=1)',
     ),
   [
     'agentpm skills search typescript',

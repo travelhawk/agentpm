@@ -134,6 +134,9 @@ async function runCli(
   );
 }
 
+// The skills.sh bridge is opt-in; these tests turn it on.
+process.env.AGENTPM_ENABLE_SKILLS_SH = '1';
+
 describe('update and cli flows', () => {
   test('parses skills.sh search responses and rejects malformed results', () => {
     const parsed = parseSkillsProviderSearchResponse({
@@ -679,6 +682,28 @@ describe('update and cli flows', () => {
       ).rejects.toThrow('Could not reach skills.sh');
     } finally {
       unreachable.close();
+    }
+  });
+
+  test('skills bridge is disabled unless AGENTPM_ENABLE_SKILLS_SH is set', async () => {
+    const homeDir = await makeTempDir('agentpm-home-');
+    const projectDir = await makeTempDir('agentpm-project-');
+    const service = new AgentPmService({
+      cwd: projectDir,
+      env: { AGENTPM_HOME: homeDir, AGENTPM_ENABLE_SKILLS_SH: '' },
+    });
+    try {
+      await expect(service.searchProviderSkills('typescript')).rejects.toThrow(
+        'disabled by default',
+      );
+      await expect(
+        service.installProviderSkill('owner/repo@skill'),
+      ).rejects.toThrow('AGENTPM_ENABLE_SKILLS_SH=1');
+      await expect(service.updateProviderSkills([])).rejects.toThrow(
+        'disabled by default',
+      );
+    } finally {
+      service.close();
     }
   });
 

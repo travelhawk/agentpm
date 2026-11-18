@@ -1,6 +1,6 @@
 # Architecture
 
-AgentPM is a Git-native CLI for discovering and managing AI skills and agent assets from repositories, local folders, owned registry indexes, and an optional public skills.sh search bridge.
+AgentPM is a Git-native CLI for discovering and managing AI skills and agent assets from repositories, local folders, owned registry indexes, and an opt-in public skills.sh search bridge (off by default).
 
 ## Runtime flow
 
@@ -71,7 +71,7 @@ The resolver may index configured sources into AgentPM state, but it does not cr
 
 Supported source shorthands include bare `owner/repo`, `github:owner/repo`, `local:<path>`, and `registry:<url-or-path>`. Full Git URLs, SSH locators, local paths, and registry index files remain supported. Private Git sources use the local Git credential setup. Private HTTP registries can be accessed with `AGENTPM_REGISTRY_TOKEN` or a host-specific environment variable such as `AGENTPM_REGISTRY_TOKEN_REGISTRY_EXAMPLE_COM`.
 
-Public no-key discovery and import is available separately through `agentpm skills search` and `agentpm skills install`, which query the public skills.sh search endpoint over HTTPS (no `npx`, no child process). Selector installs such as `owner/repo@skill` work directly, plain queries can open an interactive picker, and the resolved Git locator then flows through AgentPM's normal install path.
+Public no-key discovery and import is available separately, but only when `AGENTPM_ENABLE_SKILLS_SH=1` is set, through `agentpm skills search` and `agentpm skills install`, which query the public skills.sh search endpoint over HTTPS (no `npx`, no child process). Selector installs such as `owner/repo@skill` work directly, plain queries can open an interactive picker, and the resolved Git locator then flows through AgentPM's normal install path.
 
 `agentpm source add` stores a local index for the source. `agentpm refresh` rebuilds indexes for all configured sources, or for selected source ids and locators. `agentpm update --refresh` runs the same refresh step before checking installed skills for updates.
 

@@ -50,8 +50,8 @@ agentpm quickstart --json
 Use this when you just need a skill in this repo or on this machine.
 
 ```bash
-agentpm skills search typescript
-agentpm skills install typescript --project
+agentpm source add company/private-skills
+agentpm install my-skill --project
 agentpm list
 ```
 
@@ -118,15 +118,19 @@ skills:
 
 String skills are shorthand. Object skills bind a stable project skill name to a configured source, optional Git ref or resolved revision, runtime target, install scope, and one or more native skill items.
 
-## Public Bridge
+## Public Skills (opt-in)
 
-For public no-key discovery and import:
+AgentPM is built for private, team, and company skills. The public `skills.sh` bridge is **off by default**, because installing public skills is a supply-chain risk. For public skills, prefer `npx skills add` or another skill manager.
+
+If you still want the bridge, turn it on with an environment variable:
 
 ```bash
+export AGENTPM_ENABLE_SKILLS_SH=1   # PowerShell: $env:AGENTPM_ENABLE_SKILLS_SH = '1'
 agentpm skills search typescript
 agentpm skills install wshobson/agents@typescript-advanced-types --project
-agentpm skills install typescript
 ```
+
+Without the variable, `agentpm skills search/install/update` stop with an explanation. `skills list` and `skills remove` always work, so you can clean up existing installs.
 
 ## Machine-Readable Output
 

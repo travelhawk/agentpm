@@ -35,6 +35,9 @@ async function writeGitGlobalIgnoreConfig(
   return configPath;
 }
 
+// The skills.sh bridge is opt-in; these tests turn it on.
+process.env.AGENTPM_ENABLE_SKILLS_SH = '1';
+
 describe('install and manifest flows', () => {
   test('installs a local generic skill into project scope without creating a manifest by default', async () => {
     const homeDir = await makeTempDir('agentpm-home-');
