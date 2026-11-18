@@ -10,7 +10,16 @@ import {
   toPosixPath,
 } from '@agentpm/shared';
 
-const IGNORED_NAMES = new Set(['.git', 'node_modules', '.turbo', 'dist']);
+// Never skill content: tool output and files an OS or an interpreter writes
+// beside it. Leaving them in made a clean install look edited.
+const IGNORED_NAMES = new Set([
+  '.git',
+  'node_modules',
+  '.turbo',
+  'dist',
+  '__pycache__',
+  '.DS_Store',
+]);
 
 export async function ensureDir(dirPath: string): Promise<void> {
   await fs.mkdir(dirPath, { recursive: true });

@@ -1,6 +1,7 @@
 import {
   computeTreeSignature,
   isWithinDirectory,
+  pathExists,
   realpathOrNull,
 } from '@agentpm/fs';
 import type { InstallRecord } from '@agentpm/shared';
@@ -50,6 +51,11 @@ export async function signatureMetadata(
 export async function hasLocalEdits(install: InstallRecord): Promise<boolean> {
   const recorded = install.metadata[SIGNATURE_KEY];
   if (typeof recorded !== 'string') {
+    return false;
+  }
+  // Missing files hold no edits. Their signature is that of an empty folder,
+  // which would otherwise count as a change and block the repair.
+  if (!(await pathExists(install.linkTarget))) {
     return false;
   }
   const current = await computeTreeSignature(install.linkTarget).catch(

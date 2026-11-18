@@ -265,6 +265,55 @@ describe('edited installs from a source', () => {
     CI_TEST_TIMEOUT,
   );
 
+  test(
+    'update repairs an install whose cache was deleted, even after upstream moved',
+    async () => {
+      const { service, homeDir, repoDir, skillFile } = await setup();
+      try {
+        await fs.rm(path.join(homeDir, 'cache'), {
+          recursive: true,
+          force: true,
+        });
+        await publishUpstreamChange(repoDir);
+
+        const [preview] = await service.update({ names: ['skill-b'] });
+        expect(preview!.changed).toBe(true);
+        // Missing files cannot hold edits.
+        expect(preview!.localEdits).toBeFalsy();
+
+        await service.update({ names: ['skill-b'], apply: true, yes: true });
+        expect(await fs.readFile(skillFile, 'utf8')).toContain(
+          'upstream change',
+        );
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
+  test(
+    'files an interpreter or the OS writes into the skill do not count as edits',
+    async () => {
+      const { service, repoDir, install } = await setup();
+      try {
+        await writeFile(
+          path.join(install.targetPath, '__pycache__', 'helper.pyc'),
+          'bytecode',
+        );
+        await writeFile(path.join(install.targetPath, '.DS_Store'), 'junk');
+        await publishUpstreamChange(repoDir);
+
+        const [preview] = await service.update({ names: ['skill-b'] });
+        expect(preview!.changed).toBe(true);
+        expect(preview!.localEdits).toBeFalsy();
+      } finally {
+        service.close();
+      }
+    },
+    CI_TEST_TIMEOUT,
+  );
+
   test('the install in the current scope wins when installs share a cache folder', async () => {
     const root = await makeTempDir('agentpm-edit-shared-');
     const cacheDir = path.join(root, 'cache');
