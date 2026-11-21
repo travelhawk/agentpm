@@ -10,15 +10,27 @@ import sys
 from pathlib import Path
 
 ENV_VAR = "AGENTPM_SKILLS_REPO_URL"
-ENV_FILE_NAME = ".agentpm-manage-skills.env"
+ENV_FILE_NAME = "agentpm-manage-skills.env"
+LEGACY_ENV_FILE_NAME = ".agentpm-manage-skills.env"
 
 
 def skill_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def config_dir() -> Path:
+    # Machine-local settings live outside the skill folder, so `agentpm push`
+    # never copies them into a shared skills repository.
+    home = os.environ.get("AGENTPM_HOME")
+    return Path(home) if home else Path.home() / ".agentpm"
+
+
 def env_file_path() -> Path:
-    return skill_root() / ENV_FILE_NAME
+    return config_dir() / ENV_FILE_NAME
+
+
+def legacy_env_file_path() -> Path:
+    return skill_root() / LEGACY_ENV_FILE_NAME
 
 
 def validate_repo_url(value: str) -> str:
@@ -30,6 +42,7 @@ def validate_repo_url(value: str) -> str:
 
 def write_env_file(repo_url: str) -> Path:
     env_file = env_file_path()
+    env_file.parent.mkdir(parents=True, exist_ok=True)
     env_file.write_text(
         (
             "# Local configuration for the agentpm-manage-skills Codex skill.\n"
@@ -41,16 +54,16 @@ def write_env_file(repo_url: str) -> Path:
 
 
 def read_env_file() -> str | None:
-    env_file = env_file_path()
-    if not env_file.exists():
-        return None
-
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+    # The legacy file inside the skill folder is still read, so old setups keep working.
+    for env_file in (env_file_path(), legacy_env_file_path()):
+        if not env_file.exists():
             continue
-        if stripped.startswith(f"{ENV_VAR}="):
-            return stripped.split("=", 1)[1].strip()
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith(f"{ENV_VAR}="):
+                return stripped.split("=", 1)[1].strip()
     return None
 
 

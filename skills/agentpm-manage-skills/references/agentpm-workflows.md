@@ -28,8 +28,8 @@ agentpm quickstart --json
 Install from a private, team, or company source:
 
 ```bash
-agentpm source add internal git@github.com:company/private-skills.git
-agentpm install --from internal --skill release-helper --project --add-source
+agentpm source add git@github.com:company/private-skills.git
+agentpm install --from git@github.com:company/private-skills.git --skill release-helper --project --add-source
 agentpm list
 ```
 
