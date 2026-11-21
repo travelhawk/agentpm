@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentPM Skill Ops"
+  short_description: "Migrate, sync, and source-manage AI skills"
+  default_prompt: "Use $agentpm-manage-skills to migrate, sync, and install AI skills with AgentPM."

@@ -10,6 +10,10 @@ This repo uses a simple release workflow:
 
 ## [Unreleased]
 
+### Changed
+
+- The public skills.sh bridge (`agentpm skills search/install/update`) is now **off by default**. AgentPM focuses on private, team, and company skills, and public skills are a supply-chain risk. Set `AGENTPM_ENABLE_SKILLS_SH=1` to turn it on. `skills list` and `skills remove` keep working so existing installs can be cleaned up. Use `npx skills add` or another skill manager for public skills.
+
 ### Fixed
 
 - `agentpm adopt` of a skill installed from a source no longer fails when the home or temp folder sits behind a link (macOS `/var`, a Windows short name). AgentPM did not recognize its own cache link there and refused to replace it. This was the cause of the failing macOS and Windows CI runs.

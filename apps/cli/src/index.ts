@@ -927,7 +927,7 @@ const skillsCmd = addExamples(
   program
     .command('skills')
     .description(
-      'Search and import public skills through the skills.sh bridge',
+      'Search and import public skills through the skills.sh bridge (off by default, set AGENTPM_ENABLE_SKILLS_SH=1)',
     ),
   [
     'agentpm skills search typescript',
@@ -2580,8 +2580,6 @@ support --json for machine-readable output, and commands that prompt accept
 --yes to skip prompts (check \`agentpm <command> --help\`).
 
 ## Discover & install skills
-- agentpm skills search <query> --json          # public skills (skills.sh)
-- agentpm skills install <owner/repo@skill> --project --yes --json
 - agentpm source add <owner/repo | registry:URL | ./path> --json
 - agentpm source skills <source> --json         # list installable entries
 - agentpm install <name> --target claude --project --yes --json

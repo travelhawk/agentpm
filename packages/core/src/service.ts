@@ -108,6 +108,7 @@ import {
   type UpdatePreview,
 } from '@agentpm/shared';
 import {
+  assertPublicSkillsEnabled,
   formatProviderSkillSelector,
   resolveProviderInstallInput,
   resolveProviderInstallRequest,
@@ -705,6 +706,7 @@ export class AgentPmService {
   async searchProviderSkills(
     query: string,
   ): Promise<ProviderSkillSearchResult[]> {
+    assertPublicSkillsEnabled(this.env);
     await this.initialize();
     return searchProviderSkills(query, this.env);
   }
@@ -741,6 +743,7 @@ export class AgentPmService {
     sourceOrSelector: string,
     options: ProviderSkillInstallOptions = {},
   ): Promise<InstallRecord[]> {
+    assertPublicSkillsEnabled(this.env);
     const resolved = resolveProviderInstallInput(
       sourceOrSelector,
       options.skills ?? [],
@@ -825,6 +828,7 @@ export class AgentPmService {
     identifiers: string[] = [],
     options: UpdateOptions = {},
   ): Promise<UpdatePreview[]> {
+    assertPublicSkillsEnabled(this.env);
     await this.initialize();
     const installs = this.resolveProviderInstalls(identifiers);
     const installIds = new Set(installs.map((install) => install.id));

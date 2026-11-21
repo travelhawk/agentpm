@@ -3,6 +3,9 @@ import { AgentPmError } from '@agentpm/shared';
 const SKILLS_SH_PUBLIC_URL = 'https://skills.sh';
 // Tests and mirrors can point the bridge at another origin.
 const SKILLS_SH_URL_ENV = 'AGENTPM_SKILLS_SH_URL';
+// The public skills.sh bridge installs third-party code, so it is off unless
+// the user turns it on. AgentPM targets private, team, and company skills.
+export const PUBLIC_SKILLS_ENV = 'AGENTPM_ENABLE_SKILLS_SH';
 const SKILLS_SH_SEARCH_LIMIT = 10;
 const SKILLS_SH_TIMEOUT_MS = 15_000;
 const SKILLS_SH_MAX_RESPONSE_CHARS = 2 * 1024 * 1024;
@@ -13,6 +16,19 @@ const CONTROL_CHARACTER_PATTERN = /[\x00-\x1F\x7F-\x9F]/;
 const PROVIDER_SKILL_ID_PATTERN = /^[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*$/;
 
 export type ProviderId = 'skills.sh';
+
+export function isPublicSkillsEnabled(env: NodeJS.ProcessEnv): boolean {
+  const value = env[PUBLIC_SKILLS_ENV]?.trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes';
+}
+
+export function assertPublicSkillsEnabled(env: NodeJS.ProcessEnv): void {
+  if (!isPublicSkillsEnabled({ ...process.env, ...env })) {
+    throw new AgentPmError(
+      `The public skills.sh bridge is disabled by default because public skills are a supply-chain risk. AgentPM is built for private, team, and company skills. To use it anyway, set ${PUBLIC_SKILLS_ENV}=1.`,
+    );
+  }
+}
 
 export interface ProviderSkillSearchResult {
   provider: ProviderId;
